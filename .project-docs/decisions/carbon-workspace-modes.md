@@ -17,7 +17,7 @@ sources:
   - type: trace
     reference: Live agy 1.5.9 runs against disposable mktemp directories on 2026-11-15, described under Rationale.
     confirmed_at: 2026-11-15
-related: [../processes/session-link.md]
+related: [../processes/session-link.md, carbon-worker-turns.md]
 ---
 
 # Carbon workspace agent and review modes
@@ -109,4 +109,6 @@ depends on agy's Auto-mode review and was not verified.
 
 ## Supersedes / superseded by
 
-Unknown until sourced.
+Partly superseded by [carbon-worker-turns](carbon-worker-turns.md)
+(2026-11-15): on this account agy falls back from Auto to Default mode, so
+agent mode now adds explicit allow rules and `--add-dir` grants.

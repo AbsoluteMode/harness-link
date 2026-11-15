@@ -17,7 +17,7 @@ sources:
   - type: url
     reference: https://learn.chatgpt.com/docs/app-server
     confirmed_at: 2026-11-08
-related: [../project.md, ../decisions/carbon-workspace-modes.md]
+related: [../project.md, ../decisions/carbon-workspace-modes.md, ../decisions/carbon-worker-turns.md]
 ---
 
 # Session link operations
@@ -49,8 +49,13 @@ proof of its identity or proof that the requested work is complete.
 A Link-managed Antigravity conversation has an `antigravity:<UUID>` address.
 Its first send starts the native CLI conversation with `gemini-4-carbon-high`.
 Subsequent sends resume the saved native ID under an exclusive per-conversation
-lock. `link_status` includes Carbon's response and the model verified from the
-CLI initialization event. Codex and Claude Code use the same local registry and
+lock; messages wait while an earlier turn runs. `link_status` includes Carbon's
+response, the model verified from the CLI initialization event, live
+`progress`, and on failure `error_code`, `next_step`, `journal` and
+`stderr_tail`. The finished turn is delivered to `reply_to` as a `kind: reply`
+message, which never triggers another notification. `link_cancel` stops a turn.
+Journal, recovery, permissions and the outbox:
+[Carbon worker turns](../decisions/carbon-worker-turns.md). Codex and Claude Code use the same local registry and
 message records. Without a workspace the conversation is scoped to text
 discussion in a private folder. `link_open_antigravity` can take an absolute
 `workspace` and `mode` (`agent` by default, or `review`); both stay fixed for

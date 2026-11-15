@@ -1,6 +1,6 @@
 {
   "name": "claude-codex-link",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Persistent Claude consultations and addressed messages across Claude Code, Codex, and Gemini 4 Carbon.",
   "author": {
     "name": "max"
