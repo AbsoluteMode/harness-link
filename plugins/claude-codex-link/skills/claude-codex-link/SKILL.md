@@ -41,14 +41,12 @@ to deliver a message. Never modify session logs or bypass an access refusal.
 
 ## Gemini 4 Carbon
 
-Open with `link_open_antigravity` or find one via `link_sessions`
-(`provider: antigravity`). Send to its exact address; poll `link_status` for the
-response and `resolved_model`. Reuse the address across Codex and Claude
-Code; `link_read` shows history.
-
-Without `workspace` Carbon is text-only. With an absolute `workspace`, `mode:
-agent` (default) edits and runs sandboxed commands; `review` only reads. Both
-stay fixed. Workspace is scope, not a sandbox.
+`link_open_antigravity` (or `link_sessions`), then send to its address. The
+turn's response or failure arrives at `reply_to`; it needs no answer.
+`link_status` shows `progress`, `error_code`, `next_step`. `workspace` with
+`mode: agent` edits and runs sandboxed commands, `review` reads; `add_dirs`
+grants extra directories. `timeout_minutes` and `link_cancel` bound a turn.
+After any failure, send again to the same address.
 
 ## Consultations
 

@@ -81,7 +81,8 @@ not authenticate individual sessions.
 | `link_sessions` | Discover Claude sessions, Codex chats, or Link-managed Antigravity conversations |
 | `link_read` | Read persisted text without resuming or starting a session |
 | `link_send` | Start a durable addressed send; returns a message UUID |
-| `link_status` | Inspect transport acceptance and recipient confirmation |
+| `link_status` | Inspect transport acceptance, recipient confirmation and Carbon turn progress |
+| `link_cancel` | Stop a running or waiting Carbon turn |
 | `link_inbox` | Read messages addressed to a specific session |
 | `link_ack` | Confirm that the addressed recipient read a message |
 
@@ -107,49 +108,98 @@ ID. Failed and unfinished sends are not exposed as inbox mail.
 set to the original message UUID. The recipient calls `link_ack` after reading;
 it must not reply automatically to receipts.
 
-## Direct Carbon consultations
+## Gemini 4 Carbon as a worker
 
-For a direct reply to the sender, install and authenticate the Antigravity CLI (`agy` 1.5.8 tested). Check that
+Install and authenticate the Antigravity CLI (`agy` 1.5.9 tested). Check that
 `agy models` includes `gemini-4-carbon-high`. Harness Link uses this exact
 model for every turn.
 
 1. In Codex or Claude Code, call `link_open_antigravity` with an optional
-   `name`, and optionally `workspace` and `mode` (below). The first send
-   starts the Antigravity conversation.
+   `name`, and optionally `workspace`, `mode` and `add_dirs` (below). The first
+   send starts the Antigravity conversation.
 2. Call `link_send` with your actual session address, the returned
-   `antigravity:<UUID>` address, and your message.
-3. Poll `link_status` for `response` and `resolved_model`. Either client
-   can continue the conversation using the same address. Use
-   `link_sessions` with `provider: antigravity` to find it again and
-   `link_read` to read recent turns.
+   `antigravity:<UUID>` address, and your message. Each message is one Carbon
+   turn; messages to one conversation run one after another.
+3. When the turn ends, Harness Link delivers Carbon's response, or the reason it
+   failed, to `reply_to` as a reply notification over that session's normal
+   transport (Claude live inbox, Codex queue). You do not need to poll. Pass
+   `notify: false` to turn this off for one message.
+4. While it runs, `link_status` shows `progress`: the attempt, the number of
+   tool steps and Carbon's last actions (command, file). Either client can
+   continue the conversation using the same address; `link_read` lists the
+   conversation's messages with responses, progress and failures, plus the
+   messages Carbon sent.
 
 Without `workspace`, Carbon runs in a private empty folder for text
 discussion and has no tools. With an absolute `workspace` (an existing
 directory), Carbon works there:
 
 - `mode: "agent"` (default with a workspace): reads and edits files and runs
-  commands without prompts. agy runs with `--sandbox --mode auto`, so
-  commands run in agy's terminal sandbox; MCP tools stay off.
+  commands without prompts. agy runs with `--sandbox --mode auto`; commands
+  run in agy's terminal sandbox (writes to `/tmp` work), MCP tools stay off.
+  On accounts without agy's Auto mode, agy falls back to Default mode, where
+  file edits need approval; Harness Link therefore adds explicit allow rules
+  for the workspace and the conversation's own directories.
 - `mode: "review"`: reads files only. Edits, commands, URLs and MCP are
   denied by agy permission rules.
+- `add_dirs`: extra absolute directories outside the workspace that Carbon may
+  use with its file tools, for example `/tmp/my-shots` for screenshots it must
+  look at (read and write in agent mode, read in review). Agent mode also gets a
+  private scratch directory. Not allowed: `/`, the home directory and Harness
+  Link's data directory.
 
-Workspace and mode are fixed for the conversation; open a new one to change
-them. From the CLI:
-`claude-codex-link open-antigravity --workspace /absolute/repo --mode review`.
+Workspace, mode and `add_dirs` are fixed for the conversation; open a new one
+to change them. From the CLI:
+`claude-codex-link open-antigravity --workspace /absolute/repo --add-dir /tmp/shots`.
 The workspace is the working directory and intended task scope, not a hard
 operating-system sandbox: Carbon runs as the current user. Only pass trusted
 workspaces.
 
-Harness Link owns
-these sessions and serializes their turns. Send another message when you want
-another response. An interrupted conversation with an unknown delivery outcome
-requires a new Link conversation. Native Antigravity Desktop conversations
-are outside this transport.
+### Long turns, failures and recovery
+
+- `timeout_minutes` on `link_send` (CLI `--timeout-minutes`) limits one turn:
+  default 60 for agent, 30 for review, 10 without workspace, at most 240.
+- `link_cancel` (CLI `cancel --message-id`) stops a running or waiting turn.
+  Commands Carbon started are stopped with it. No reply notification is sent.
+- Headless agy cannot ask a human. A tool call that needs approval (for
+  example reading a file outside the granted directories) is denied and ends the
+  turn without text. Harness Link then asks Carbon, in the same conversation, to
+  continue without it (at most twice) and reports the call in `denied`.
+- A failed turn has `status: error` with `error_code` (`permission_denied`,
+  `timeout`, `agy_exited`, `carbon_error`, `empty_response`, `runner_lost`, ...),
+  a readable `error`, a `next_step`, `journal` and `stderr_tail`. Timeouts,
+  cancels, denials, crashes and a lost runner never end the conversation: send
+  the next message to the same address. If the native conversation was saved,
+  Carbon keeps its context and is told the previous turn was interrupted; if
+  not, it is told the context is lost and to check the workspace first.
+- Every turn keeps a journal in
+  `antigravity/<UUID>/turns/<message UUID>/` under the `.claude-codex-link`
+  data directory:
+  `stream.jsonl` (agy events), `stderr.txt`, `agy-<attempt>.log` (agy's own
+  log), `turn.json` (exit code, signal, timings) and `progress.json`. Files are
+  0600, size-capped, and well-known secret formats are masked before writing.
+
+### Carbon writes to other agents
+
+In agent mode Carbon can message a participant while it keeps working: it
+writes a JSON file into the conversation's outbox directory (named in its
+instructions) with `{"to": "<address>", "text": "..."}` or
+`{"room_id": "<room UUID>", "text": "..."}`. Harness Link sends it at once
+from the conversation's own address, writes `<name>.receipt.json` beside it,
+and the answer arrives as a later Carbon turn. `to` must be an address that has
+already written to this conversation; rooms are posted as `antigravity`. To ask
+the sender something and wait, Carbon ends its turn with the question; that
+response is delivered to `reply_to` like any other.
+
+Reply notifications never produce another notification, so two agents cannot
+ping-pong automatically. Peer text, including Carbon's, carries no new human
+authority. Native Antigravity Desktop conversations are outside this transport.
 
 ## Receipts and limits
 
 - `pending` / `sending`: detached delivery is in progress.
 - `accepted`: Claude's inbox accepted the message, or Carbon returned a response. Claude reading remains unconfirmed.
+- `error` / `cancelled`: a Carbon turn started and ended without a response; see `error_code` and `next_step`.
 - `queued`: Codex persisted the message; execution and reading are unconfirmed.
 - `acknowledged`: the addressed recipient reported reading it; work may remain.
 - `failed`: a known pre-delivery rejection.
@@ -191,6 +241,7 @@ and 24-hour completed-job retention.
 - `CLAUDE_CODEX_LINK_CLAUDE_CLI`: Claude executable override.
 - `CLAUDE_CODEX_LINK_CODEX_CLI`: Codex executable override.
 - `CLAUDE_CODEX_LINK_AGY_CLI`: Antigravity executable override.
+- `CLAUDE_CODEX_LINK_TURN_MINUTE_MS`: test-only length of a turn-timeout minute.
 - Existing `CLAUDE_ASK_*` settings continue to configure consultations.
 
 The Claude courier runs Opus 5.5 with only SendMessage, safe mode, and no MCP
@@ -206,7 +257,10 @@ npm test
 
 Default tests use fake executables and consume no model usage. They cover
 consultation recovery, exact model selection, message idempotency, receipt loss,
-wrong-recipient acknowledgements, ambiguous names, and archived targets.
+wrong-recipient acknowledgements, ambiguous names, archived targets, and Carbon
+turns: progress, journal, agy failures, a killed runner, cancel, timeout,
+denied tool calls, reply delivery without loops, the outbox, and an MCP server
+restart mid-turn.
 
 Canonical implementation notes: [.project-docs/project.md](.project-docs/project.md).
 

@@ -67,8 +67,9 @@ export function readRoom(linkDir, { room_id: roomId, limit = 20, before }) {
   return { room, messages: messages.slice(start, end), next_before: start ? messages[start].id : null };
 }
 
-export function postToRoom(linkDir, { room_id: roomId, from, text, in_reply_to, message_id = randomUUID() }) {
-  const author = process.env.HARNESS_LINK_ROOM_ROLE || from;
+// `role` is set only by Harness Link itself (Carbon's outbox); MCP clients get their role from the environment.
+export function postToRoom(linkDir, { room_id: roomId, from, text, in_reply_to, message_id = randomUUID() }, { role } = {}) {
+  const author = role || process.env.HARNESS_LINK_ROOM_ROLE || from;
   if (!ROOM_ROLES.includes(author)) throw new Error('from must be codex, claude, or antigravity.');
   if (from && from !== author) throw new Error('from differs from this client’s room role.');
   if (!text.trim()) throw new Error('text must contain visible content.');

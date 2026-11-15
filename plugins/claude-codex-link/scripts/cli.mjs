@@ -3,10 +3,10 @@ import { readFileSync } from 'node:fs';
 import { handleLink } from './link.mjs';
 
 const [command, ...rest] = process.argv.slice(2);
-const names = { 'open-room': 'link_open_room', rooms: 'link_rooms', 'room-read': 'link_room_read', 'room-post': 'link_room_post', 'open-antigravity': 'link_open_antigravity', sessions: 'link_sessions', read: 'link_read', send: 'link_send', status: 'link_status', inbox: 'link_inbox', ack: 'link_ack' };
+const names = { 'open-room': 'link_open_room', rooms: 'link_rooms', 'room-read': 'link_room_read', 'room-post': 'link_room_post', 'open-antigravity': 'link_open_antigravity', sessions: 'link_sessions', read: 'link_read', send: 'link_send', status: 'link_status', inbox: 'link_inbox', ack: 'link_ack', cancel: 'link_cancel' };
 try {
   if (!names[command]) {
-    console.log('Harness Link\nCommands: open-room, rooms, room-read, room-post, open-antigravity, sessions, read, send, status, inbox, ack\nOptions map to MCP fields: --provider claude|codex|antigravity, --session provider:UUID, --to, --from, --reply-to, --message-id, --recipient, --delivery queue|live, --workspace /absolute/dir and --mode agent|review (open-antigravity).\nSend body via --stdin or --text-file PATH (never argv). Example: printf hello | claude-codex-link send --from codex:UUID --to claude:UUID --stdin');
+    console.log('Harness Link\nCommands: open-room, rooms, room-read, room-post, open-antigravity, sessions, read, send, status, cancel, inbox, ack\nOptions map to MCP fields: --provider claude|codex|antigravity, --session provider:UUID, --to, --from, --reply-to, --message-id, --recipient, --delivery queue|live, --workspace /absolute/dir, --mode agent|review and repeatable --add-dir /absolute/dir (open-antigravity), --timeout-minutes N and --notify true|false (send to Antigravity).\nSend body via --stdin or --text-file PATH (never argv). Example: printf hello | claude-codex-link send --from codex:UUID --to claude:UUID --stdin');
     process.exit(command ? 1 : 0);
   }
   const args = {};
@@ -17,7 +17,13 @@ try {
     if (!/^--[a-z-]+$/.test(flag) || rest[i + 1] === undefined) throw new Error('Invalid CLI option.');
     const key = flag.slice(2).replaceAll('-', '_');
     if (key === 'text') throw new Error('Use --stdin or --text-file so message text stays out of argv.');
-    args[key] = key === 'limit' ? Number(rest[++i]) : rest[++i];
+    const value = rest[++i];
+    if (key === 'add_dir') { (args.add_dirs ||= []).push(value); continue; }
+    if (['limit', 'timeout_minutes'].includes(key)) args[key] = Number(value);
+    else if (key === 'notify') {
+      if (!['true', 'false'].includes(value)) throw new Error('--notify takes true or false.');
+      args[key] = value === 'true';
+    } else args[key] = value;
   }
   console.log(JSON.stringify(await handleLink(names[command], args), null, 2));
 } catch (error) { console.error(JSON.stringify({ error: error.message })); process.exitCode = 1; }
