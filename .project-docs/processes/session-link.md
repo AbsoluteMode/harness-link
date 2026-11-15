@@ -17,7 +17,7 @@ sources:
   - type: url
     reference: https://learn.chatgpt.com/docs/app-server
     confirmed_at: 2026-11-08
-related: [../project.md]
+related: [../project.md, ../decisions/carbon-workspace-modes.md]
 ---
 
 # Session link operations
@@ -51,8 +51,11 @@ Its first send starts the native CLI conversation with `gemini-4-carbon-high`.
 Subsequent sends resume the saved native ID under an exclusive per-conversation
 lock. `link_status` includes Carbon's response and the model verified from the
 CLI initialization event. Codex and Claude Code use the same local registry and
-message records. The conversation is scoped to text discussion in a private
-workspace.
+message records. Without a workspace the conversation is scoped to text
+discussion in a private folder. `link_open_antigravity` can take an absolute
+`workspace` and `mode` (`agent` by default, or `review`); both stay fixed for
+the conversation. Flags and rationale:
+[Carbon workspace modes](../decisions/carbon-workspace-modes.md).
 
 ## Shared rooms
 

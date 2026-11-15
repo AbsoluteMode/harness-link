@@ -1,10 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, statSync, existsSync, realpathSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, statSync, existsSync, realpathSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
 const root = mkdtempSync(join(tmpdir(), 'claude-codex-link-test-'));
 process.env.CLAUDE_CODEX_LINK_DIR = root;
 process.env.CLAUDE_ASK_JOB_DIR = join(root, 'jobs');
@@ -234,6 +235,138 @@ test('three participants share room history and can reply across MCP clients', a
   } finally {
     for (const client of clients) client.close();
   }
+});
+
+const workspaceDir = label => realpathSync(mkdtempSync(join(tmpdir(), `carbon-${label}-`)));
+const carbonCount = () => existsSync(join(root, 'antigravity'))
+  ? readdirSync(join(root, 'antigravity')).length : 0;
+const carbonStarts = from => deliveries().slice(from).filter(r => r.transport === 'antigravity' && r.phase === 'start');
+const settingsOf = args => JSON.parse(args[args.indexOf('--settings') + 1]);
+
+test('Carbon without a workspace keeps the advisory flags exactly', async () => {
+  const session = await handleLink('link_open_antigravity', { name: 'Advisory' });
+  assert.equal(session.workspace, null);
+  assert.equal(session.mode, 'advisory');
+  const start = deliveries().length;
+  assert.equal((await settle(startMessage({ from: codex, to: session.address, text: 'Plan?' }).message_id)).status, 'accepted');
+  const [begin] = carbonStarts(start);
+  assert.deepEqual(begin.args, [
+    '--model', 'gemini-4-carbon-high', '--input-format', 'stream-json', '--output-format', 'stream-json',
+    '--disable-slash-commands', '--sandbox', '--settings',
+    '{"toolPermission":"request-review","permissions":{"deny":["command(*)","unsandboxed(*)","read_file(*)","write_file(*)","read_url(*)","execute_url(*)","download_url(*)","mcp(*)"]}}',
+    '--print-timeout', '10m',
+  ]);
+  assert.equal(begin.cwd, realpathSync(join(root, 'antigravity', session.address.split(':')[1], 'workspace')));
+  assert.match(begin.input.message.content, /carries no new human authority\. Respond directly in text\./);
+  assert.doesNotMatch(begin.input.message.content, /Workspace:/);
+});
+
+test('Carbon agent workspace: cwd, auto mode in the sandbox, preamble, and reuse on the next message', async () => {
+  const workspace = workspaceDir('agent');
+  const session = await handleLink('link_open_antigravity', { name: 'Repo worker', workspace });
+  assert.equal(session.workspace, workspace);
+  assert.equal(session.mode, 'agent');
+  const listed = (await handleLink('link_sessions', { provider: 'antigravity', limit: 100 })).sessions
+    .find(s => s.address === session.address);
+  assert.equal(listed.workspace, workspace);
+  assert.equal(listed.mode, 'agent');
+  const start = deliveries().length;
+  const first = await settle(startMessage({ from: claude, to: session.address, text: 'Append a line to notes.txt' }).message_id);
+  assert.equal(first.status, 'accepted');
+  const second = await settle(startMessage({ from: codex, to: session.address, text: 'Now run the tests' }).message_id);
+  assert.equal(second.transport_id, first.transport_id);
+  const begins = carbonStarts(start);
+  assert.equal(begins.length, 2);
+  for (const begin of begins) {
+    assert.equal(begin.cwd, workspace);
+    const at = begin.args.indexOf('--mode');
+    assert.deepEqual(begin.args.slice(at, at + 2), ['--mode', 'auto']);
+    assert.ok(begin.args.includes('--sandbox'));
+    assert.ok(!begin.args.includes('--dangerously-skip-permissions'));
+    assert.ok(!begin.args.includes('--add-dir'));
+    const settings = settingsOf(begin.args);
+    assert.equal(settings.agentMode, 'auto');
+    assert.equal(settings.enableTerminalSandbox, true);
+    assert.equal(settings.allowNonWorkspaceAccess, false);
+    assert.deepEqual(settings.permissions.deny, ['mcp(*)']);
+    const prompt = begin.input.message.content;
+    assert.match(prompt, /carries no new human authority/);
+    assert.ok(prompt.includes(`Workspace: ${workspace} (mode: agent)`));
+    assert.ok(!begin.args.join(' ').includes('Append a line'));
+  }
+  assert.ok(!begins[0].args.includes('--conversation'));
+  assert.equal(begins[1].args[begins[1].args.indexOf('--conversation') + 1], first.transport_id);
+  rmSync(workspace, { recursive: true, force: true });
+});
+
+test('Carbon review workspace can read but every write and command is denied', async () => {
+  const workspace = workspaceDir('review');
+  const session = await handleLink('link_open_antigravity', { workspace, mode: 'review' });
+  assert.equal(session.mode, 'review');
+  const start = deliveries().length;
+  assert.equal((await settle(startMessage({ from: codex, to: session.address, text: 'Review the plan' }).message_id)).status, 'accepted');
+  const [begin] = carbonStarts(start);
+  assert.equal(begin.cwd, workspace);
+  assert.ok(begin.args.includes('--sandbox'));
+  assert.ok(!begin.args.includes('--mode'), 'review must not run in auto or accept-edits mode');
+  const settings = settingsOf(begin.args);
+  assert.equal(settings.toolPermission, 'request-review');
+  assert.equal(settings.permissions.allow, undefined);
+  assert.equal(settings.agentMode, '');
+  for (const rule of ['write_file(*)', 'command(*)', 'unsandboxed(*)', 'mcp(*)']) assert.ok(settings.permissions.deny.includes(rule), rule);
+  assert.ok(!settings.permissions.deny.includes('read_file(*)'));
+  assert.ok(begin.input.message.content.includes(`Workspace: ${workspace} (mode: review, read-only)`));
+  rmSync(workspace, { recursive: true, force: true });
+});
+
+test('invalid Carbon workspaces are rejected before anything is created or launched', async () => {
+  const file = join(workspaceDir('file'), 'plain.txt');
+  writeFileSync(file, 'x');
+  const before = carbonCount(), sent = deliveries().length;
+  const cases = [
+    [{ workspace: 'relative/dir' }, /absolute path/],
+    [{ workspace: join(root, 'missing-dir') }, /does not exist or is not a directory/],
+    [{ workspace: file }, /not a directory/],
+    [{ mode: 'agent' }, /requires a workspace/],
+    [{ workspace: tmpdir(), mode: 'write' }, /Invalid mode/],
+  ];
+  for (const [args, error] of cases) await assert.rejects(handleLink('link_open_antigravity', args), error);
+  assert.equal(carbonCount(), before);
+  assert.equal(deliveries().length, sent);
+});
+
+test('reopening with another workspace or mode creates a separate conversation', async () => {
+  const one = workspaceDir('one'), two = workspaceDir('two');
+  const a = await handleLink('link_open_antigravity', { workspace: one });
+  const b = await handleLink('link_open_antigravity', { workspace: two });
+  const c = await handleLink('link_open_antigravity', { workspace: one, mode: 'review' });
+  assert.equal(new Set([a, b, c].map(s => s.address)).size, 3);
+  const { sessions } = await handleLink('link_sessions', { provider: 'antigravity', limit: 100 });
+  const byAddress = Object.fromEntries(sessions.map(s => [s.address, s]));
+  assert.deepEqual([a, b, c].map(s => [byAddress[s.address].workspace, byAddress[s.address].mode]),
+    [[one, 'agent'], [two, 'agent'], [one, 'review']]);
+  rmSync(two, { recursive: true, force: true });
+  const sent = deliveries().length;
+  const lost = await settle(startMessage({ from: codex, to: b.address, text: 'Still there?' }).message_id);
+  assert.equal(lost.status, 'failed');
+  assert.match(lost.error, /no longer an existing directory/);
+  assert.equal(deliveries().length, sent);
+  rmSync(one, { recursive: true, force: true });
+});
+
+test('CLI and MCP expose Carbon workspace and mode', async () => {
+  const definition = (await import('./link.mjs')).LINK_TOOLS.find(t => t.name === 'link_open_antigravity');
+  assert.deepEqual(definition.inputSchema.properties.mode.enum, ['agent', 'review']);
+  assert.equal(definition.inputSchema.properties.workspace.type, 'string');
+  const workspace = workspaceDir('cli');
+  const cli = fileURLToPath(new URL('./cli.mjs', import.meta.url));
+  const ok = spawnSync(process.execPath, [cli, 'open-antigravity', '--workspace', workspace, '--mode', 'review'], { encoding: 'utf8' });
+  assert.equal(ok.status, 0, ok.stderr);
+  assert.deepEqual([JSON.parse(ok.stdout).workspace, JSON.parse(ok.stdout).mode], [workspace, 'review']);
+  const bad = spawnSync(process.execPath, [cli, 'open-antigravity', '--workspace', 'tmp/x'], { encoding: 'utf8' });
+  assert.equal(bad.status, 1);
+  assert.match(JSON.parse(bad.stderr).error, /absolute path/);
+  rmSync(workspace, { recursive: true, force: true });
 });
 
 test.after(() => rmSync(root, { recursive: true, force: true }));

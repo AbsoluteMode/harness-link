@@ -41,12 +41,14 @@ to deliver a message. Never modify session logs or bypass an access refusal.
 
 ## Gemini 4 Carbon
 
-Open a conversation with `link_open_antigravity` or discover existing ones
-with `link_sessions` and `provider: antigravity`. Send to its exact
-`antigravity:<UUID>` address with your actual sender address. Poll
-`link_status` for the text response and exact `resolved_model`. A Carbon
-response comes back on the original receipt. Use the same address from
-Codex and Claude Code to share context. Read prior turns with `link_read`.
+Open with `link_open_antigravity` or find one via `link_sessions`
+(`provider: antigravity`). Send to its exact address; poll `link_status` for the
+response and `resolved_model`. Reuse the address across Codex and Claude
+Code; `link_read` shows history.
+
+Without `workspace` Carbon is text-only. With an absolute `workspace`, `mode:
+agent` (default) edits and runs sandboxed commands; `review` only reads. Both
+stay fixed. Workspace is scope, not a sandbox.
 
 ## Consultations
 

@@ -114,7 +114,8 @@ For a direct reply to the sender, install and authenticate the Antigravity CLI (
 model for every turn.
 
 1. In Codex or Claude Code, call `link_open_antigravity` with an optional
-   `name`. The first send starts the Antigravity conversation.
+   `name`, and optionally `workspace` and `mode` (below). The first send
+   starts the Antigravity conversation.
 2. Call `link_send` with your actual session address, the returned
    `antigravity:<UUID>` address, and your message.
 3. Poll `link_status` for `response` and `resolved_model`. Either client
@@ -122,7 +123,24 @@ model for every turn.
    `link_sessions` with `provider: antigravity` to find it again and
    `link_read` to read recent turns.
 
-Carbon runs in a private workspace for text discussion. Harness Link owns
+Without `workspace`, Carbon runs in a private empty folder for text
+discussion and has no tools. With an absolute `workspace` (an existing
+directory), Carbon works there:
+
+- `mode: "agent"` (default with a workspace): reads and edits files and runs
+  commands without prompts. agy runs with `--sandbox --mode auto`, so
+  commands run in agy's terminal sandbox; MCP tools stay off.
+- `mode: "review"`: reads files only. Edits, commands, URLs and MCP are
+  denied by agy permission rules.
+
+Workspace and mode are fixed for the conversation; open a new one to change
+them. From the CLI:
+`claude-codex-link open-antigravity --workspace /absolute/repo --mode review`.
+The workspace is the working directory and intended task scope, not a hard
+operating-system sandbox: Carbon runs as the current user. Only pass trusted
+workspaces.
+
+Harness Link owns
 these sessions and serializes their turns. Send another message when you want
 another response. An interrupted conversation with an unknown delivery outcome
 requires a new Link conversation. Native Antigravity Desktop conversations
