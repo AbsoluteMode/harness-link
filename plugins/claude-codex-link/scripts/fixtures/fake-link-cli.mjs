@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 const args = process.argv.slice(2);
 const claudeId = '11111111-1111-4111-8111-111111111111';
 const randomConversation = () => randomUUID();
+const rejectionsOf = key => existsSync(process.env.LINK_TEST_DELIVERIES) ? readFileSync(process.env.LINK_TEST_DELIVERIES, 'utf8').split('\n').filter(l => l.includes(`"key":"${key}"`)).length : 0;
 const record = value => appendFileSync(process.env.LINK_TEST_DELIVERIES, JSON.stringify(value) + '\n');
 if (args[0] === '--model') {
   const mode = process.env.LINK_TEST_MODE;
@@ -124,7 +125,35 @@ if (args[0] === '--model') {
   let input = '';
   for await (const chunk of process.stdin) input += chunk;
   const data = JSON.parse(input);
+  const courierMode = process.env.LINK_TEST_MODE;
+  // Shapes copied from a real `claude -p --output-format stream-json` run that failed authentication.
+  const courierKey = createHash('sha256').update(data.message).digest('hex').slice(0, 16);
+  const rejected = (error, text, status = 401) => {
+    record({ transport: 'claude-rejected', error, key: courierKey });
+    console.log(JSON.stringify({ type: 'system', subtype: 'init' }));
+    console.log(JSON.stringify({ type: 'assistant', error, is_api_error_message: true, api_error_status: status, message: { model: '<synthetic>', content: [{ type: 'text', text }] } }));
+    console.log(JSON.stringify({ type: 'result', subtype: 'success', is_error: true, terminal_reason: 'api_error', api_error_status: status, result: text, modelUsage: {} }));
+    process.exit(1);
+  };
+  if (courierMode === 'courier-auth-expired') rejected('authentication_failed', 'Failed to authenticate: OAuth session expired and could not be refreshed');
+  if (courierMode === 'courier-overloaded') rejected('overloaded', 'API Error: 529 Overloaded', 529);
+  if (courierMode === 'courier-refresh-race' || courierMode === 'courier-refresh-race-forever') {
+    const seen = rejectionsOf(courierKey);
+    if (courierMode.endsWith('forever') || seen < 2) rejected('authentication_failed', 'Failed to refresh OAuth token: another Claude Code process is refreshing it. Please retry in a minute.');
+  }
+  if (courierMode === 'courier-crash') {
+    record({ transport: 'claude-crash' });
+    process.stderr.write('Error: socket hang up\n    at connResetException\n');
+    process.exit(1);
+  }
   record({ transport: 'claude', args, body: data.message });
+  if (courierMode === 'courier-interrupted') {
+    // The tool call was issued and the process died before reporting: delivery may have happened.
+    console.log(JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'tool-1', name: 'SendMessage', input: { recipient: data.recipient_name, content: data.message } }] } }));
+    console.log(JSON.stringify({ type: 'assistant', error: 'authentication_failed', message: { model: '<synthetic>', content: [{ type: 'text', text: 'Failed to authenticate' }] } }));
+    console.log(JSON.stringify({ type: 'result', is_error: true, result: 'Failed to authenticate' }));
+    process.exit(1);
+  }
   console.log(JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'tool-1', name: 'SendMessage', input: { recipient: data.recipient_name, content: data.message } }] } }));
   console.log(JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'tool-1', content: JSON.stringify({ success: true, msg_id: 'accepted-1' }) }] } }));
   console.log(JSON.stringify({ type: 'result', modelUsage: { 'claude-opus-5-5': {} }, result: 'sent' }));

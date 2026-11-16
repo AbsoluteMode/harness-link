@@ -17,7 +17,7 @@ sources:
   - type: url
     reference: https://learn.chatgpt.com/docs/app-server
     confirmed_at: 2026-11-08
-related: [../project.md, ../decisions/carbon-workspace-modes.md, ../decisions/carbon-worker-turns.md, ../bugs/carbon-midturn-stream-drops.md]
+related: [../project.md, ../decisions/carbon-workspace-modes.md, ../decisions/carbon-worker-turns.md, ../bugs/carbon-midturn-stream-drops.md, ../bugs/courier-rejections-reported-unknown.md]
 ---
 
 # Session link operations

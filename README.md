@@ -202,7 +202,9 @@ authority. Native Antigravity Desktop conversations are outside this transport.
 - `error` / `cancelled`: a Carbon turn started and ended without a response; see `error_code` and `next_step`.
 - `queued`: Codex persisted the message; execution and reading are unconfirmed.
 - `acknowledged`: the addressed recipient reported reading it; work may remain.
-- `failed`: a known pre-delivery rejection.
+- `failed`: a known pre-delivery rejection. This includes a Claude courier the API rejected before it
+  requested any tool (expired login, overload): `error_code` is `courier_auth` or `courier_api_error`
+  and `next_step` says what to do. A token-refresh race is retried twice within 90 seconds first.
 - `unknown`: delivery may have occurred, but its receipt was lost. Inspect the
   recipient before sending again; the bridge never automatically resends.
 
