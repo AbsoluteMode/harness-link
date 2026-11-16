@@ -19,12 +19,14 @@ export const MAX_ADD_DIRS = 8;
 // Tests shrink the minute so timeouts can be exercised in milliseconds.
 const MINUTE_MS = Number(process.env.CLAUDE_CODEX_LINK_TURN_MINUTE_MS) || 60_000;
 const MAX_DENIAL_CONTINUES = 2;
+const MAX_TRANSIENT_CONTINUES = 1;
 const MAX_OUTBOX_PER_TURN = 10;
 const MAX_OUTBOX_BYTES = 64 * 1024;
 const STREAM_LIMIT = 16 * 1024 * 1024;
 const STDERR_LIMIT = 1024 * 1024;
 const AGY_LOG_LIMIT = 2 * 1024 * 1024;
 const KILL_GRACE_MS = 5_000;
+const POST_EXIT_DRAIN_MS = 1_500;
 
 // Advisory (no workspace): text only, every tool category denied. Unchanged since the first release.
 const SETTINGS = JSON.stringify({
@@ -174,6 +176,17 @@ function continuePrompt(session, directory, denied) {
     `${denied.join('; ') || 'a tool that needs a human confirmation'}. Headless runs cannot ask a human for approval. ` +
     allowed + 'Do not retry the denied call or work around the denial. Continue the original task without it and say in ' +
     'your final reply what you could not do and why.';
+}
+
+function emptyContinuePrompt() {
+  return 'Harness Link note: your previous turn finished without a text response, and the sender only receives your final text reply. ' +
+    'Summarise what you did and write your complete final response in text now.';
+}
+
+function transientContinuePrompt() {
+  return 'Harness Link note: the CLI reported a stream or transport error on your previous turn before your reply was delivered. ' +
+    'Check the current state of the conversation and workspace, finish any remaining work, and write your complete final response in full ' +
+    '(the sender only receives the text of this turn, not earlier turns).';
 }
 
 function sessionDirectory(linkDir, id) {
@@ -374,9 +387,9 @@ function descendantGroups(rootPid, known) {
   }
 }
 
-function stopLeftovers(known) {
+function stopLeftovers(known, signal = 'SIGTERM') {
   for (const [pgid, command] of known) {
-    if (command && groupExists(pgid) && processCommand(pgid) === command) stopGroup(pgid, 'SIGTERM');
+    if (command && groupExists(pgid) && processCommand(pgid) === command) stopGroup(pgid, signal);
   }
 }
 
@@ -426,7 +439,8 @@ function runAgy({ args, input, cwd, turnDir, attempt, deadline, cancelled, onIni
     const stderr = new CappedFile(join(turnDir, 'stderr.txt'), STDERR_LIMIT);
     stream.write(JSON.stringify({ link_event: 'attempt', attempt, at: new Date().toISOString() }) + '\n');
     const state = { init: null, result: null, denied: [], code: null, signal: null, timedOut: false,
-      cancelled: false, spawnError: null, stderrText: '', startedAt: Date.now() };
+      cancelled: false, spawnError: null, stderrText: '', startedAt: Date.now(),
+      lastStep: -1, activeTools: new Set(), agentStep: { index: -1, state: null, text: '', completed: false } };
     let child;
     try {
       child = spawn(antigravityCli(), args, { cwd, detached: true, shell: false, stdio: ['pipe', 'pipe', 'pipe'] });
@@ -435,14 +449,20 @@ function runAgy({ args, input, cwd, turnDir, attempt, deadline, cancelled, onIni
       resolve({ ...state, spawnError: error });
       return;
     }
-    let done = false, pending = '', stopping = null, polls = 0;
+    let done = false, pending = '', stopping = null, exitDrain = null, polls = 0;
     const groups = new Map();
     const stop = () => {
       if (stopping || !child.pid) return;
       descendantGroups(child.pid, groups);
-      stopping = setTimeout(() => stopGroup(child.pid, 'SIGKILL'), KILL_GRACE_MS);
-      stopping.unref();
       stopGroup(child.pid, 'SIGTERM');
+      stopLeftovers(groups, 'SIGTERM');
+      stopping = setTimeout(() => {
+        stopGroup(child.pid, 'SIGKILL');
+        stopLeftovers(groups, 'SIGKILL');
+        child.stdout.destroy();
+        child.stderr.destroy();
+      }, KILL_GRACE_MS);
+      stopping.unref();
     };
     if (child.pid) onSpawn(child.pid);
     const handle = line => {
@@ -452,6 +472,23 @@ function runAgy({ args, input, cwd, turnDir, attempt, deadline, cancelled, onIni
       else if (event?.event === 'result') state.result = event.result || {};
       else if (event?.event === 'step_update') {
         const step = event.step_update || {};
+        const idx = Number.isInteger(step.step_index) ? step.step_index : -1;
+        if (idx >= 0 && step.step_type !== 'checkpoint' && idx >= state.lastStep) state.lastStep = idx;
+        if (step.step_type === 'tool' && idx >= 0) {
+          if (step.state === 'ACTIVE') state.activeTools.add(idx);
+          else state.activeTools.delete(idx);
+        } else if (step.step_type === 'agent_response' && idx >= 0) {
+          if (idx > state.agentStep.index) state.agentStep = { index: idx, state: null, text: '', completed: false };
+          if (idx === state.agentStep.index) {
+            if (step.state) state.agentStep.state = step.state;
+            if (typeof step.text_delta === 'string' && state.agentStep.text.length < STREAM_LIMIT) {
+              state.agentStep.text += step.text_delta;
+            }
+            if (step.state === 'DONE' && (step.duration_seconds !== undefined || step.usage !== undefined)) {
+              state.agentStep.completed = true;
+            }
+          }
+        }
         const denied = deniedFrom(step.tool_info?.error?.message);
         if (denied && !state.denied.includes(denied)) state.denied.push(denied);
         onProgress(step, denied);
@@ -482,17 +519,31 @@ function runAgy({ args, input, cwd, turnDir, attempt, deadline, cancelled, onIni
       if (done) return;
       done = true;
       clearInterval(poll);
+      if (stopping) clearTimeout(stopping);
+      if (exitDrain) clearTimeout(exitDrain);
       if (pending) handle(pending);
       state.code = code; state.signal = signal;
       stream.write(JSON.stringify({ link_event: 'exit', attempt, code, signal, at: new Date().toISOString() }) + '\n');
       stream.close(); stderr.close();
       // Commands Carbon started must not outlive the turn.
       if (child.pid && groupExists(child.pid)) stopGroup(child.pid, 'SIGTERM');
-      stopLeftovers(groups);
-      if (stopping) clearTimeout(stopping);
+      stopLeftovers(groups, 'SIGTERM');
       resolve(state);
     };
     child.once('error', error => { state.spawnError = error; setImmediate(() => finish(null, null)); });
+    // Hook or background grandchildren can inherit agy's stdio pipes and keep 'close' from firing
+    // after agy itself has exited; drain briefly, then close the pipes and finish.
+    child.once('exit', (code, signal) => {
+      if (done) return;
+      stopLeftovers(groups, 'SIGTERM');
+      exitDrain = setTimeout(() => {
+        stopLeftovers(groups, 'SIGKILL');
+        child.stdout.destroy();
+        child.stderr.destroy();
+        finish(code, signal);
+      }, POST_EXIT_DRAIN_MS);
+      exitDrain.unref();
+    });
     child.once('close', finish);
     child.stdin.end(input);
   });
@@ -502,6 +553,33 @@ function agyError(stderrText) {
   const line = stderrText.split('\n').findLast(l => l.startsWith('AGY_ERROR: '));
   if (!line) return null;
   try { return JSON.parse(line.slice('AGY_ERROR: '.length)); } catch { return null; }
+}
+
+function completedText(run) {
+  const result = run.result;
+  const direct = typeof result?.response === 'string' ? result.response.trim() : '';
+  if (result?.status === 'SUCCESS' && direct && run.code === 0 && !result.finished_reason) return direct;
+  // agy 1.5.9 latches an earlier mid-turn ERROR_MESSAGE step (for example a 503 stream drop that
+  // run.go automatically retried 4 seconds later) and exits with an error status/code even when a
+  // later final agent_response step finished cleanly with usage/duration and no active tools.
+  if (!run.timedOut && !run.cancelled &&
+      result?.finished_reason !== 'print_timeout' && result?.finished_reason !== 'interrupted' &&
+      run.agentStep?.completed && run.agentStep.index >= 0 &&
+      run.agentStep.index === run.lastStep && run.activeTools.size === 0) {
+    return direct || run.agentStep.text.trim();
+  }
+  return '';
+}
+
+function isRetryableFailure(failure, run) {
+  if (!['carbon_error', 'agy_exited', 'empty_response'].includes(failure.code)) return false;
+  if (failure.code === 'empty_response') return true;
+  const err = agyError(run.stderrText);
+  if (err?.retryable === false) return false;
+  if (['PERMISSION_DENIED', 'UNAUTHENTICATED', 'INVALID_ARGUMENT', 'NOT_FOUND', 'FAILED_PRECONDITION'].includes(err?.status)) {
+    return false;
+  }
+  return true;
 }
 
 function classify(run, session) {
@@ -523,18 +601,22 @@ function classify(run, session) {
   if (run.timedOut || result?.finished_reason === 'print_timeout' || error?.reason === 'print_timeout') {
     return turnError('timeout', 'Carbon reached the turn time limit before it answered.');
   }
+  if (!run.init) {
+    return turnError('protocol_error', result
+      ? 'agy returned a result without its initialization event.'
+      : `agy exited${run.code !== null ? ` with code ${run.code}` : ''}${run.signal ? ` on ${run.signal}` : ''} before it returned a result.`);
+  }
+  const response = completedText(run);
+  if (response) return null;
   if (!result) {
-    return turnError(run.init ? 'agy_exited' : 'protocol_error',
+    return turnError('agy_exited',
       `agy exited${run.code !== null ? ` with code ${run.code}` : ''}${run.signal ? ` on ${run.signal}` : ''} before it returned a result.`);
   }
-  if (!run.init) return turnError('protocol_error', 'agy returned a result without its initialization event.');
-  const response = typeof result.response === 'string' ? result.response.trim() : '';
-  if (result.status === 'SUCCESS' && response && run.code === 0) return null;
   const deniedActions = (result.denied_actions || []).map(a => a.action).filter(Boolean);
-  if (!response && (run.denied.length || deniedActions.length)) {
+  if (run.denied.length || deniedActions.length) {
     return turnError('permission_denied', `agy denied a tool call that needs a human confirmation in headless mode: ${(run.denied.length ? run.denied : deniedActions).join('; ')}.`);
   }
-  if (result.status === 'SUCCESS' && !response && run.code === 0) {
+  if (result.status === 'SUCCESS' && run.code === 0) {
     return turnError('empty_response', 'Carbon finished the turn without a text response.');
   }
   return turnError('carbon_error', `agy reported ${result.status || 'no status'}${error?.short_error ? `: ${error.short_error}` : ''}` +
@@ -646,13 +728,16 @@ export async function sendAntigravity(linkDir, message, { cancelled = () => fals
     const dirs = session.workspace ? grantedDirs(directory, session) : [];
     const turn = { message_id: message.id, conversation: session.address, started_at: startedAt, timeout_minutes: timeoutMinutes, attempts: [] };
     const saveTurn = () => { try { atomicWriteJson(join(turnDir, 'turn.json'), turn); } catch {} };
-    let failure = null, run = null;
-    for (let attempt = 1; attempt <= 1 + MAX_DENIAL_CONTINUES; attempt++) {
+    let failure = null, run = null, denialContinues = 0, transientContinues = 0;
+    const maxAttempts = 1 + MAX_DENIAL_CONTINUES + MAX_TRANSIENT_CONTINUES;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       const remaining = deadline - Date.now();
       if (attempt > 1 && remaining < MINUTE_MS / 2) break;
-      const input = JSON.stringify({ event: 'user', message: { content: attempt === 1
-        ? carbonPrompt(session, message, { directory, notes })
-        : continuePrompt(session, directory, run.denied) } }) + '\n';
+      const promptText = attempt === 1 ? carbonPrompt(session, message, { directory, notes })
+        : failure.code === 'permission_denied' ? continuePrompt(session, directory, run.denied)
+        : failure.code === 'empty_response' ? emptyContinuePrompt()
+        : transientContinuePrompt();
+      const input = JSON.stringify({ event: 'user', message: { content: promptText } }) + '\n';
       const timeout = attempt === 1 ? `${timeoutMinutes}m` : `${Math.max(30, Math.ceil(remaining * 60 / MINUTE_MS))}s`;
       progress.attempt = attempt;
       dirty = true; flush();
@@ -698,12 +783,23 @@ export async function sendAntigravity(linkDir, message, { cancelled = () => fals
       saveTurn();
       sanitizeFile(join(turnDir, `agy-${attempt}.log`), AGY_LOG_LIMIT);
       failure = classify(run, session);
-      if (!failure || failure.code !== 'permission_denied' || run.cancelled || cancelled()) break;
+      if (!failure || run.cancelled || cancelled()) break;
+      if (failure.code === 'permission_denied' && denialContinues < MAX_DENIAL_CONTINUES) {
+        denialContinues++;
+        continue;
+      }
+      if (session.conversation_id && transientContinues < MAX_TRANSIENT_CONTINUES && isRetryableFailure(failure, run)) {
+        transientContinues++;
+        await sleep(Math.min(1_500, Math.max(50, Math.floor(MINUTE_MS / 40))));
+        if (cancelled()) break;
+        continue;
+      }
+      break;
     }
     processOutbox(outbox, session, deliverOutbox, outboxRecord);
     if (failure?.block) session = updateSession(directory, { blocked: failure.block });
-    if (failure?.code === 'permission_denied' && turn.attempts.length > 1) {
-      failure.message += ` Harness Link asked Carbon to continue without it ${turn.attempts.length - 1} time(s).`;
+    if (failure?.code === 'permission_denied' && denialContinues > 0) {
+      failure.message += ` Harness Link asked Carbon to continue without it ${denialContinues} time(s).`;
     }
     progress.phase = 'finished';
     progress.finished_at = new Date().toISOString();
@@ -728,10 +824,12 @@ export async function sendAntigravity(linkDir, message, { cancelled = () => fals
     return {
       status: 'accepted', ...common,
       resolved_model: CARBON_MODEL,
-      response: run.result.response.trim(),
-      detail: turn.attempts.length > 1
-        ? `Gemini 4 Carbon returned a response after ${turn.attempts.length - 1} denied tool call(s); see denied.`
-        : 'Gemini 4 Carbon returned a response.',
+      response: completedText(run),
+      detail: denialContinues > 0
+        ? `Gemini 4 Carbon returned a response after ${denialContinues} denied tool call(s); see denied.`
+        : transientContinues > 0
+          ? 'Gemini 4 Carbon returned a response after recovering from an interrupted turn.'
+          : 'Gemini 4 Carbon returned a response.',
     };
   } finally {
     if (owned) {

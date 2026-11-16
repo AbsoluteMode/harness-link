@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { mkdirSync, readdirSync, readFileSync, existsSync } from 'node:fs';
 import { homedir, uptime } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { atomicWriteJson, ensurePrivateDirectory } from './lib.mjs';
 import { address, UUID, listSessions, readSession } from './transports.mjs';
@@ -11,7 +11,26 @@ import { createRecord, readPrivateJson } from './link-storage.mjs';
 import { ROOM_ROLES, listRooms, openRoom, postToRoom, readRoom } from './rooms.mjs';
 
 export const LINK_DIR = process.env.CLAUDE_CODEX_LINK_DIR || join(homedir(), '.claude-codex-link');
-const RUNNER = fileURLToPath(new URL('./link-runner.mjs', import.meta.url));
+const SELF_RUNNER = fileURLToPath(new URL('./link-runner.mjs', import.meta.url));
+const SEMVER = /^\d+\.\d+\.\d+$/;
+function cmpSemver(a, b) {
+  const pa = a.split('.').map(Number), pb = b.split('.').map(Number);
+  return (pa[0] - pb[0]) || (pa[1] - pb[1]) || (pa[2] - pb[2]);
+}
+/** Resolves the newest installed link-runner when running from a versioned plugin cache. */
+export function resolveRunner(selfRunner = SELF_RUNNER) {
+  try {
+    const versionDir = dirname(dirname(selfRunner));
+    if (!SEMVER.test(basename(versionDir))) return selfRunner;
+    const cacheRoot = dirname(versionDir);
+    const best = readdirSync(cacheRoot, { withFileTypes: true })
+      .filter(e => e.isDirectory() && SEMVER.test(e.name) && existsSync(join(cacheRoot, e.name, 'scripts', 'link-runner.mjs')))
+      .map(e => e.name)
+      .sort(cmpSemver)
+      .at(-1);
+    return best ? join(cacheRoot, best, 'scripts', 'link-runner.mjs') : selfRunner;
+  } catch { return selfRunner; }
+}
 export function messagePath(id) {
   if (!UUID.test(id || '')) throw new Error('message_id must be a UUID.');
   return join(LINK_DIR, 'messages', id.toLowerCase());
@@ -92,7 +111,7 @@ export function startMessage(args) {
     if (Object.keys(payload).some(k => (prior[k] ?? defaults[k] ?? null) !== payload[k])) throw new Error('message_id already belongs to a different payload.');
     return { ...messageStatus(id), duplicate: true };
   }
-  const runner = spawn(process.execPath, [RUNNER, id], { env: process.env, cwd: path, detached: true, stdio: 'ignore', shell: false });
+  const runner = spawn(process.execPath, [resolveRunner(), id], { env: process.env, cwd: path, detached: true, stdio: 'ignore', shell: false });
   runner.once('error', () => saveState(id, { status: 'failed', error: 'Message runner could not start.' }));
   runner.unref();
   return { ...messageStatus(id), duplicate: false };

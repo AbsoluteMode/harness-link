@@ -19,10 +19,26 @@ function claudeCli() {
   return process.env.CLAUDE_CODEX_LINK_CLAUDE_CLI || process.env.CLAUDE_ASK_CLI ||
     (existsSync(join(homedir(), '.local/bin/claude')) ? join(homedir(), '.local/bin/claude') : 'claude');
 }
-export function run(command, args, input = '', { returnExitCode = false, ...options } = {}) {
+export function run(command, args, input = '', { returnExitCode = false, timeoutMs = 120_000, ...options } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { ...options, shell: false, stdio: ['pipe', 'pipe', 'pipe'] });
-    let output = '', bytes = 0, overflow = false;
+    let output = '', bytes = 0, overflow = false, timedOut = false, settled = false;
+    const finish = fn => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      fn();
+    };
+    const timer = timeoutMs > 0 ? setTimeout(() => {
+      timedOut = true;
+      child.kill('SIGTERM');
+      setTimeout(() => {
+        try { child.kill('SIGKILL'); } catch {}
+        child.stdout.destroy();
+        child.stderr.destroy();
+      }, 2_000).unref();
+    }, timeoutMs) : null;
+    if (timer) timer.unref();
     child.stdout.setEncoding('utf8');
     child.stderr.resume();
     child.stdin.on('error', () => {});
@@ -31,13 +47,14 @@ export function run(command, args, input = '', { returnExitCode = false, ...opti
       if (bytes > 8 * 1024 * 1024) { overflow = true; child.kill('SIGTERM'); }
       else output += chunk;
     });
-    child.once('error', () => reject(Object.assign(new Error('Executable could not start.'), { notSent: true })));
-    child.once('close', code => {
-      if (overflow) reject(new Error('Transport output exceeded its limit; check recipient before retrying.'));
+    child.once('error', () => finish(() => reject(Object.assign(new Error('Executable could not start.'), { notSent: true }))));
+    child.once('close', code => finish(() => {
+      if (timedOut) reject(new Error('Transport timed out; check recipient before retrying.'));
+      else if (overflow) reject(new Error('Transport output exceeded its limit; check recipient before retrying.'));
       else if (returnExitCode) resolve({ output, code });
       else if (code !== 0) reject(new Error('Transport exited without success; delivery may have occurred.'));
       else resolve(output);
-    });
+    }));
     child.stdin.end(input);
   });
 }
@@ -45,7 +62,7 @@ export async function withCodex(callback) {
   const client = new RpcClient(process.env.CLAUDE_CODEX_LINK_CODEX_CLI || 'codex', ['app-server', '--listen', 'stdio://']);
   try {
     try {
-      await client.request('initialize', { clientInfo: { name: 'claude_codex_link', version: '0.8.0' }, capabilities: { experimentalApi: true } });
+      await client.request('initialize', { clientInfo: { name: 'claude_codex_link', version: '0.8.1' }, capabilities: { experimentalApi: true } });
       client.notify('initialized');
     } catch (e) { e.notSent = true; throw e; }
     return await callback(client);

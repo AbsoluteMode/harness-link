@@ -655,4 +655,51 @@ test('a Carbon turn survives an MCP server restart and is read back by a new ser
   } finally { client.close(); }
 });
 
+test('latched mid-turn 503 error does not drop a completed final Carbon response', async () => {
+  const session = await agentSession('latched-503');
+  const done = await settle(startMessage({ from: claude, to: session.address, text: 'FAKE:latched-stream-error', notify: false }).message_id);
+  assert.equal(done.status, 'accepted');
+  assert.equal(done.attempts, 1);
+  assert.equal(done.response, 'Recovered after 503');
+});
+
+test('cut-off mid-stream error is never returned partial and recovers via in-conversation continuation', async () => {
+  const session = await agentSession('cutoff-503');
+  const done = await settle(startMessage({ from: claude, to: session.address, text: 'FAKE:cutoff-stream-error', notify: false }).message_id, 8000);
+  assert.equal(done.status, 'accepted');
+  assert.equal(done.attempts, 2);
+  assert.equal(done.response, 'Completed on continuation');
+});
+
+test('empty response without denials continues once in the same conversation', async () => {
+  const session = await agentSession('empty-once');
+  const done = await settle(startMessage({ from: claude, to: session.address, text: 'FAKE:empty-once', notify: false }).message_id, 8000);
+  assert.equal(done.status, 'accepted');
+  assert.equal(done.attempts, 2);
+  assert.equal(done.response, 'Summarised after empty reply');
+});
+
+test('leaked grandchild stdio pipes do not hang the runner after agy exits', async () => {
+  const session = await agentSession('leaked-pipe');
+  const started = Date.now();
+  const done = await settle(startMessage({ from: claude, to: session.address, text: 'FAKE:leaked-pipe', notify: false }).message_id, 8000);
+  assert.equal(done.status, 'accepted');
+  assert.equal(done.response, 'Pipe drained cleanly');
+  assert.ok(Date.now() - started < 5000);
+  const leaked = deliveries().find(r => r.phase === 'leaked' && r.conversation === done.transport_id);
+  if (leaked?.pid) { try { process.kill(-leaked.pid, 'SIGKILL'); } catch {} }
+});
+
+test('resolveRunner selects the highest installed semver runner in a plugin cache', async () => {
+  const { resolveRunner } = await import('./link.mjs');
+  const cache = mkdtempSync(join(tmpdir(), 'link-cache-'));
+  for (const v of ['0.7.0', '0.8.0', '0.8.1', '0.10.0']) {
+    mkdirSync(join(cache, v, 'scripts'), { recursive: true });
+    writeFileSync(join(cache, v, 'scripts', 'link-runner.mjs'), '// runner');
+  }
+  assert.equal(resolveRunner(join(cache, '0.7.0', 'scripts', 'link-runner.mjs')), join(cache, '0.10.0', 'scripts', 'link-runner.mjs'));
+  assert.equal(resolveRunner('/repo/plugins/claude-codex-link/scripts/link-runner.mjs'), '/repo/plugins/claude-codex-link/scripts/link-runner.mjs');
+  rmSync(cache, { recursive: true, force: true });
+});
+
 test.after(() => rmSync(root, { recursive: true, force: true }));

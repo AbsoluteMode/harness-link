@@ -75,6 +75,32 @@ if (args[0] === '--model') {
     process.stderr.write('debug token=supersecretvalue123 and Bearer abcdefghijklmnopqrstuv\n');
     step(2, 'DONE', 'run_command', { CommandLine: 'export ANTHROPIC_API_KEY=sk-ant-api03-SECRETSECRETSECRETSECRET' }, { output: 'password: hunter2hunter2' });
     result('Secret handled');
+  } else if (text === 'FAKE:latched-stream-error') {
+    emit({ event: 'step_update', step_update: { conversation_id: conversation, step_index: 40, state: 'DONE', step_type: 'agent_response', text_delta: '' } });
+    emit({ event: 'step_update', step_update: { conversation_id: conversation, step_index: 41, state: 'DONE', step_type: 'error_message' } });
+    emit({ event: 'step_update', step_update: { conversation_id: conversation, step_index: 42, state: 'ACTIVE', step_type: 'agent_response', text_delta: 'Recovered ' } });
+    emit({ event: 'step_update', step_update: { conversation_id: conversation, step_index: 42, state: 'DONE', step_type: 'agent_response', text_delta: 'after 503', duration_seconds: 12.4, usage: { total_tokens: 100 } } });
+    process.stderr.write('AGY_ERROR: {"short_error":"UNAVAILABLE","status":"UNAVAILABLE","retryable":true}\n');
+    emit({ event: 'result', result: { conversation_id: conversation, status: 'ERROR', response: '', finished_reason: 'error' } });
+    process.exit(3);
+  } else if (text === 'FAKE:cutoff-stream-error') {
+    if (content.includes('stream or transport error')) {
+      result('Completed on continuation');
+    } else {
+      emit({ event: 'step_update', step_update: { conversation_id: conversation, step_index: 10, state: 'ACTIVE', step_type: 'agent_response', text_delta: 'Half of a sen' } });
+      process.stderr.write('AGY_ERROR: {"short_error":"stream interrupted","status":"UNAVAILABLE","retryable":true}\n');
+      emit({ event: 'result', result: { conversation_id: conversation, status: 'ERROR', response: 'Half of a sen', finished_reason: 'error' } });
+      process.exit(3);
+    }
+  } else if (text === 'FAKE:empty-once') {
+    if (content.includes('finished without a text response')) result('Summarised after empty reply');
+    else result('');
+  } else if (text === 'FAKE:leaked-pipe') {
+    const leaked = spawn(process.execPath, ['-e', 'setInterval(() => {}, 60_000)'], { detached: true, stdio: ['ignore', 'inherit', 'inherit'] });
+    leaked.unref();
+    record({ transport: 'antigravity', phase: 'leaked', pid: leaked.pid, conversation });
+    result('Pipe drained cleanly');
+    process.exit(0);
   } else if (text.startsWith('FAKE:outbox:')) {
     const outbox = args.filter((a, i) => args[i - 1] === '--add-dir').find(d => d.endsWith('/outbox'));
     const items = JSON.parse(text.slice('FAKE:outbox:'.length));
