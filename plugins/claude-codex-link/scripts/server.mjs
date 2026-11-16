@@ -42,7 +42,7 @@ import {
 } from "./lib.mjs";
 
 const SERVER_NAME = "claude-codex-link";
-const SERVER_VERSION = "0.8.1";
+const SERVER_VERSION = "0.8.2";
 const RUNNER_PATH = fileURLToPath(new URL("./job-runner.mjs", import.meta.url));
 const TERMINAL_STATUSES = new Set(["completed", "error", "cancelled"]);
 const SERVER_BOOT_STARTED_AT = Date.now() - uptime() * 1_000;

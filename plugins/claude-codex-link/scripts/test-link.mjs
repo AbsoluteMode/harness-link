@@ -14,7 +14,7 @@ process.env.CLAUDE_CODEX_LINK_CLAUDE_CLI = fileURLToPath(new URL('./fixtures/fak
 process.env.CLAUDE_CODEX_LINK_CODEX_CLI = process.env.CLAUDE_CODEX_LINK_CLAUDE_CLI;
 process.env.CLAUDE_CODEX_LINK_AGY_CLI = process.env.CLAUDE_CODEX_LINK_CLAUDE_CLI;
 const { startMessage, messageStatus, acknowledge, inbox, handleLink } = await import('./link.mjs');
-const { listSessions, address, run } = await import('./transports.mjs');
+const { listSessions, address, run, classifyCourier } = await import('./transports.mjs');
 const { RpcClient } = await import('./rpc.mjs');
 const claude = 'claude:11111111-1111-4111-8111-111111111111';
 const codex = 'codex:33333333-3333-4333-8333-333333333333';
@@ -72,6 +72,83 @@ test('ambiguous Claude names fail without a send', async () => {
   assert.equal((await settle(a.message_id)).status, 'failed');
   assert.equal(deliveries().length, before);
   delete process.env.LINK_TEST_MODE;
+});
+// WHY: 13 Codex→Claude notifications were lost on 12–14 Nov: the courier was rejected at login,
+// nothing was sent, and the sender was told "delivery may have occurred; do not resend".
+test('courier rejected at login is failed with the reason, not unknown', async () => {
+  process.env.LINK_TEST_MODE = 'courier-auth-expired';
+  const before = deliveries().filter(d => d.transport === 'claude').length;
+  const a = startMessage({ from: codex, to: claude, text: 'queue notification' });
+  const r = await settle(a.message_id);
+  delete process.env.LINK_TEST_MODE;
+  assert.equal(r.status, 'failed');
+  assert.equal(r.error_code, 'courier_auth');
+  assert.match(r.error, /OAuth session expired/);
+  assert.match(r.error, /Nothing was sent/);
+  assert.match(r.next_step, /log in again/);
+  assert.equal(deliveries().filter(d => d.transport === 'claude').length, before);
+  assert.ok(!inbox({ recipient: claude }).messages.some(m => m.id === a.message_id));
+  assert.throws(() => acknowledge({ message_id: a.message_id, recipient: claude }), /cannot be acknowledged/);
+});
+test('courier rejected by an overloaded API is failed without a login hint', async () => {
+  process.env.LINK_TEST_MODE = 'courier-overloaded';
+  const a = startMessage({ from: codex, to: claude, text: 'overloaded' });
+  const r = await settle(a.message_id);
+  delete process.env.LINK_TEST_MODE;
+  assert.equal(r.status, 'failed');
+  assert.equal(r.error_code, 'courier_api_error');
+  assert.doesNotMatch(r.next_step, /log in/);
+});
+test('token-refresh race is retried and delivers exactly once', async () => {
+  process.env.LINK_TEST_MODE = 'courier-refresh-race';
+  process.env.CLAUDE_CODEX_LINK_COURIER_RETRY_MS = '30,30';
+  const rejectedBefore = deliveries().filter(d => d.transport === 'claude-rejected').length;
+  const a = startMessage({ from: codex, to: claude, text: 'survives the race' });
+  const r = await settle(a.message_id);
+  delete process.env.LINK_TEST_MODE;
+  assert.equal(r.status, 'accepted');
+  assert.equal(deliveries().filter(d => d.transport === 'claude-rejected').length - rejectedBefore, 2);
+  assert.equal(deliveries().filter(d => d.transport === 'claude' && d.body.includes('survives the race')).length, 1);
+});
+test('token-refresh race that never clears stops after bounded retries as failed', async () => {
+  process.env.LINK_TEST_MODE = 'courier-refresh-race-forever';
+  process.env.CLAUDE_CODEX_LINK_COURIER_RETRY_MS = '20,20';
+  const rejectedBefore = deliveries().filter(d => d.transport === 'claude-rejected').length;
+  const a = startMessage({ from: codex, to: claude, text: 'never clears' });
+  const r = await settle(a.message_id);
+  delete process.env.LINK_TEST_MODE;
+  delete process.env.CLAUDE_CODEX_LINK_COURIER_RETRY_MS;
+  assert.equal(r.status, 'failed');
+  assert.equal(deliveries().filter(d => d.transport === 'claude-rejected').length - rejectedBefore, 3);
+  assert.match(r.next_step, /in a minute/);
+});
+test('courier that died after issuing SendMessage stays unknown and is never retried', async () => {
+  process.env.LINK_TEST_MODE = 'courier-interrupted';
+  const a = startMessage({ from: codex, to: claude, text: 'maybe delivered' });
+  const r = await settle(a.message_id);
+  delete process.env.LINK_TEST_MODE;
+  assert.equal(r.transport_status, 'unknown');
+  assert.match(r.error, /delivery may have occurred/);
+  assert.equal(deliveries().filter(d => d.transport === 'claude' && d.body.includes('maybe delivered')).length, 1);
+});
+test('courier crash without a result event stays unknown and reports exit code and stderr', async () => {
+  process.env.LINK_TEST_MODE = 'courier-crash';
+  const a = startMessage({ from: codex, to: claude, text: 'crashed' });
+  const r = await settle(a.message_id);
+  delete process.env.LINK_TEST_MODE;
+  assert.equal(r.transport_status, 'unknown');
+  assert.match(r.error, /exit code 1/);
+  assert.match(r.error, /no result event/);
+  assert.match(r.error, /socket hang up/);
+});
+test('real rejected-courier output classifies as not sent', () => {
+  const output = readFileSync(fileURLToPath(new URL('./fixtures/courier-auth-rejected.jsonl', import.meta.url)), 'utf8');
+  assert.throws(() => classifyCourier({ output, code: 1, stderr: '' }, { name: 'x', body: 'y' }),
+    e => e.notSent === true && e.code === 'courier_auth' && !e.retryable);
+  // The same stream cut before its result event proves nothing.
+  const cut = output.split('\n').filter(l => !l.includes('"type":"result"')).join('\n');
+  assert.throws(() => classifyCourier({ output: cut, code: 1, stderr: '' }, { name: 'x', body: 'y' }),
+    e => !e.notSent && /delivery may have occurred/.test(e.message));
 });
 test('archived Codex rejects; live request never silently becomes a queue send', async () => {
   process.env.LINK_TEST_MODE = 'archived';

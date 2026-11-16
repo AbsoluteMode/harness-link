@@ -190,7 +190,7 @@ async function fakeTests() {
   const manifest = JSON.parse(
     readFileSync(join(pluginRoot, ".codex-plugin", "plugin.json"), "utf8"),
   );
-  assert.equal(manifest.version, "0.8.1");
+  assert.equal(manifest.version, "0.8.2");
   assert.ok(
     manifest.interface.defaultPrompt.some((prompt) =>
       /without repository tools/i.test(prompt),
