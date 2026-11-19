@@ -7,6 +7,7 @@ import { postToRoom } from './rooms.mjs';
 import { address, queueCodex, sendClaude } from './transports.mjs';
 
 const id = process.argv[2];
+const STORED_NEXT_STEP = 'The message is saved in the recipient\'s mailbox and the session was not woken. It receives it from the Harness Link hook on its next turn, or by calling link_inbox. Do not resend it.';
 const base = { pid: process.pid, boot_started_at: Date.now() - uptime() * 1000 };
 
 // Carbon's outbox: the sender identity is always the conversation itself.
@@ -67,7 +68,11 @@ try {
   for (const key of ['next_step', 'journal', 'attempts', 'denied', 'outbox', 'recovered', 'transport', 'transport_id']) {
     if (error[key] !== undefined) extra[key] = error[key];
   }
-  const status = error.status === 'cancelled' ? 'cancelled' : error.notSent ? 'failed' : error.status || 'unknown';
+  // WHY: .project-docs/decisions/claude-mailbox-delivery.md
+  // Mail for Claude is already in its mailbox: a wake-up that provably did not happen is `stored`, not lost.
+  const stored = error.notSent && message && address(message.to).provider === 'claude';
+  if (stored) extra.next_step = [error.next_step, STORED_NEXT_STEP].filter(Boolean).join(' ');
+  const status = error.status === 'cancelled' ? 'cancelled' : stored ? 'stored' : error.notSent ? 'failed' : error.status || 'unknown';
   state = { ...base, status, error: error.message, ...(error.code && typeof error.code === 'string' && !error.code.startsWith('E') ? { error_code: error.code } : {}),
     ...extra, completed_at: new Date().toISOString() };
 }

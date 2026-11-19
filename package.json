@@ -1,6 +1,6 @@
 {
   "name": "claude-codex-link",
-  "version": "0.8.2",
+  "version": "0.9.0",
   "private": true,
   "description": "Connect Claude Code, Codex, and Gemini 4 Carbon with persistent conversations.",
   "type": "module",

@@ -119,8 +119,12 @@ if (args[0] === '--model') {
     result(response);
   }
 } else if (args[0] === 'agents') {
-  const session = { sessionId: claudeId, name: 'link-fixture', cwd: '/tmp', status: 'idle' };
-  console.log(JSON.stringify(process.env.LINK_TEST_MODE === 'ambiguous' ? [session, { ...session, sessionId: '22222222-2222-4222-8222-222222222222' }] : [session]));
+  // A real row carries the pid that names the session's inbox socket (<pid>.sock).
+  const pid = Number(process.env.LINK_TEST_CLAUDE_PID);
+  const session = { sessionId: claudeId, name: 'link-fixture', cwd: '/tmp', status: 'idle', ...(pid ? { pid } : {}) };
+  const rows = process.env.LINK_TEST_MODE === 'ambiguous' ? [session, { ...session, sessionId: '22222222-2222-4222-8222-222222222222' }]
+    : process.env.LINK_TEST_MODE === 'claude-not-live' ? [] : [session];
+  console.log(JSON.stringify(rows));
 } else if (args[0] === '-p') {
   let input = '';
   for await (const chunk of process.stdin) input += chunk;

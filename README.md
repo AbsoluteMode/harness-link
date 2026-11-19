@@ -87,9 +87,10 @@ not authenticate individual sessions.
 | `link_ack` | Confirm that the addressed recipient read a message |
 
 Discover the exact address first (`claude:<UUID>` or `codex:<UUID>`). Titles are
-labels; never guess a recipient from a partial name. Claude's current name must
-be unique and stable during delivery because its native SendMessage resolves
-that name. Only send when the human has authorized the exchange.
+labels; never guess a recipient from a partial name. A live Claude session is
+reached through its own inbox socket by exact session ID. Only the courier
+fallback needs the session's name to be unique. Only send when the human has
+authorized the exchange.
 
 ```sh
 claude-codex-link sessions --provider claude
@@ -198,13 +199,13 @@ authority. Native Antigravity Desktop conversations are outside this transport.
 ## Receipts and limits
 
 - `pending` / `sending`: detached delivery is in progress.
-- `accepted`: Claude's inbox accepted the message, or Carbon returned a response. Claude reading remains unconfirmed.
+- `accepted`: the message was written to Claude's inbox socket (or the courier's SendMessage was accepted), or Carbon returned a response. Claude Code sends no receipt for a socket write: a message its inbound policy holds or refuses looks the same. Reading remains unconfirmed.
+- `stored`: mail for Claude that is saved in the recipient's mailbox but could not wake the session (not running, no route, courier rejected). The recipient gets it from the plugin hook on its next turn or with `link_inbox`. Do not resend. `error_code` gives the reason (`wake_not_live`, `wake_no_route`, `wake_ambiguous_name`, `wake_discovery_failed`, `courier_auth`, `courier_api_error`).
 - `error` / `cancelled`: a Carbon turn started and ended without a response; see `error_code` and `next_step`.
 - `queued`: Codex persisted the message; execution and reading are unconfirmed.
 - `acknowledged`: the addressed recipient reported reading it; work may remain.
-- `failed`: a known pre-delivery rejection. This includes a Claude courier the API rejected before it
-  requested any tool (expired login, overload): `error_code` is `courier_auth` or `courier_api_error`
-  and `next_step` says what to do. A token-refresh race is retried twice within 90 seconds first.
+- `failed`: a known pre-delivery rejection for Codex or Carbon, for example an archived Codex thread.
+  Mail for Claude is never `failed`; see `stored`.
 - `unknown`: delivery may have occurred, but its receipt was lost. Inspect the
   recipient before sending again; the bridge never automatically resends.
 
@@ -246,9 +247,16 @@ and 24-hour completed-job retention.
 - `CLAUDE_CODEX_LINK_TURN_MINUTE_MS`: test-only length of a turn-timeout minute.
 - Existing `CLAUDE_ASK_*` settings continue to configure consultations.
 
-The Claude courier runs Opus 5.5 with only SendMessage, safe mode, and no MCP
-servers. Each live send invokes a short Claude turn. A local mailbox and explicit
-receipt avoid confusing model output with confirmed transport delivery.
+- `CLAUDE_CODEX_LINK_CLAUDE_TRANSPORT=courier`: skip the inbox socket and use the courier.
+- `CLAUDE_CODEX_LINK_SOCKET_DIR`: directory holding Claude inbox sockets (`<pid>.sock`); by default
+  the directory of `CLAUDE_CODE_MESSAGING_SOCKET`, then `/tmp/cc-socks` and `/tmp/cc-socks-<uid>`.
+
+Delivery to Claude needs no model: one line is written to the session's inbox
+socket, which starts a turn in an idle session. The courier (Opus 5.5 with only
+SendMessage, safe mode, no MCP servers) runs only when a live session has no
+usable socket; a token-refresh race there is retried twice within 90 seconds.
+In Claude Code the plugin also installs a hook (SessionStart, UserPromptSubmit,
+Stop) that shows a session its `stored` and `unknown` mail once.
 
 ## Development
 

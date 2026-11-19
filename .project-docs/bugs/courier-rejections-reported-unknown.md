@@ -20,7 +20,7 @@ sources:
   - type: trace
     reference: Claude Code 2.1.325, claude -p --output-format stream-json run with an invalid API key on 2026-11-16; output kept as scripts/fixtures/courier-auth-rejected.jsonl.
     confirmed_at: 2026-11-16
-related: [../processes/session-link.md]
+related: [../processes/session-link.md, ../decisions/claude-mailbox-delivery.md]
 ---
 
 # Claude courier rejected at login was reported as unknown and the message was lost
@@ -66,6 +66,13 @@ code.
   (`CLAUDE_CODEX_LINK_COURIER_RETRY_MS` overrides the delays). A retry is safe
   because it follows a proven non-delivery. An expired login is not retried: it
   lasted 25 minutes in the journal and needs the human.
+
+## Superseded in part (2026-11-19)
+
+A rejected courier no longer ends as `failed`: the message stays in the
+recipient's mailbox as `stored` and the courier itself runs only when the inbox
+socket is unusable. See [Claude mailbox delivery](../decisions/claude-mailbox-delivery.md).
+`classifyCourier` and its retry rule are unchanged.
 
 ## Not covered
 
