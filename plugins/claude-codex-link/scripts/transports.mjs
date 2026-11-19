@@ -1,7 +1,8 @@
 import { spawn } from 'node:child_process';
-import { existsSync, readdirSync, createReadStream } from 'node:fs';
+import { existsSync, readdirSync, createReadStream, lstatSync } from 'node:fs';
+import { connect } from 'node:net';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { RpcClient } from './rpc.mjs';
 import { DEFAULT_MODEL } from './lib.mjs';
@@ -63,19 +64,24 @@ export async function withCodex(callback) {
   const client = new RpcClient(process.env.CLAUDE_CODEX_LINK_CODEX_CLI || 'codex', ['app-server', '--listen', 'stdio://']);
   try {
     try {
-      await client.request('initialize', { clientInfo: { name: 'claude_codex_link', version: '0.8.2' }, capabilities: { experimentalApi: true } });
+      await client.request('initialize', { clientInfo: { name: 'claude_codex_link', version: '0.9.0' }, capabilities: { experimentalApi: true } });
       client.notify('initialized');
     } catch (e) { e.notSent = true; throw e; }
     return await callback(client);
   } finally { client.close(); }
 }
+/** Live Claude Code sessions as `claude agents --json` reports them, including the pid that names each inbox socket. */
+async function claudeRows() {
+  const rows = JSON.parse(await run(claudeCli(), ['agents', '--json']));
+  if (!Array.isArray(rows)) throw new Error('Unexpected Claude session list.');
+  return rows.filter(r => UUID.test(r?.sessionId || ''));
+}
 export async function listSessions({ provider, cwd, limit = 30, cursor } = {}) {
   if (!['claude', 'codex'].includes(provider)) throw new Error('provider must be claude or codex.');
   if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new Error('limit must be 1..100.');
   if (provider === 'claude') {
-    const rows = JSON.parse(await run(claudeCli(), ['agents', '--json']));
-    if (!Array.isArray(rows)) throw new Error('Unexpected Claude session list.');
-    return { sessions: rows.filter(r => UUID.test(r.sessionId || '') && (!cwd || r.cwd === cwd)).slice(0, limit).map(r => ({ address: `claude:${r.sessionId}`, name: r.name, cwd: r.cwd, status: r.status, kind: r.kind })), next_cursor: null };
+    const rows = await claudeRows();
+    return { sessions: rows.filter(r => !cwd || r.cwd === cwd).slice(0, limit).map(r => ({ address: `claude:${r.sessionId}`, name: r.name, cwd: r.cwd, status: r.status, kind: r.kind })), next_cursor: null };
   }
   return withCodex(async client => {
     const r = await client.request('thread/list', { limit, ...(cwd ? { cwd } : {}), ...(cursor ? { cursor } : {}), sortKey: 'updated_at', useStateDbOnly: true });
@@ -150,9 +156,9 @@ export function classifyCourier({ output, code, stderr }, { name, body }) {
     const race = REFRESH_RACE.test(text);
     throw Object.assign(new Error(`Courier was rejected before sending (${apiError.error}): ${text} Nothing was sent.`), {
       notSent: true, retryable: race, code: auth ? 'courier_auth' : 'courier_api_error',
-      next_step: race ? 'Another Claude Code process was refreshing the login. Send again with a new message_id in a minute.'
-        : auth ? 'Claude Code login on this machine has expired. Ask the human to log in again, then send with a new message_id.'
-        : 'The Claude API rejected the courier request. Send again with a new message_id once it recovers.',
+      next_step: race ? 'Another Claude Code process was refreshing the login.'
+        : auth ? 'Claude Code login on this machine has expired. Ask the human to log in again.'
+        : 'The Claude API rejected the courier request.',
     });
   }
   if (code !== 0) {
@@ -175,15 +181,83 @@ export function classifyCourier({ output, code, stderr }, { name, body }) {
   }
   throw new Error('Claude inbox acceptance was not confirmed; do not automatically resend.');
 }
+// WHY: .project-docs/decisions/claude-mailbox-delivery.md
+// Every live Claude Code session listens on <sockets dir>/<pid>.sock. One JSON line there starts a turn
+// in an idle session and is shown to Claude as a message from another session, under the recipient's
+// inbound policy. No model, login or network is involved, so nothing can reword or drop the text.
+function claudeSocketDirs() {
+  if (process.env.CLAUDE_CODEX_LINK_SOCKET_DIR) return [process.env.CLAUDE_CODEX_LINK_SOCKET_DIR];
+  const own = process.env.CLAUDE_CODE_MESSAGING_SOCKET;
+  const uid = typeof process.getuid === 'function' ? process.getuid() : null;
+  return [...new Set([own ? dirname(own) : null, '/tmp/cc-socks', uid === null ? null : `/tmp/cc-socks-${uid}`].filter(Boolean))];
+}
+/** The inbox socket of the session with this pid, only when it is a socket this user owns. */
+export function claudeSocketPath(pid) {
+  if (!Number.isSafeInteger(pid) || pid < 1) return null;
+  const uid = typeof process.getuid === 'function' ? process.getuid() : null;
+  for (const dir of claudeSocketDirs()) {
+    const path = join(dir, `${pid}.sock`);
+    try {
+      const stat = lstatSync(path);
+      if (stat.isSocket() && (uid === null || stat.uid === uid)) return path;
+    } catch {}
+  }
+  return null;
+}
+const SOCKET_RECEIPT = { status: 'accepted', transport: 'claude-inbox-socket', transport_id: null,
+  detail: 'Written to the session inbox socket. Claude Code sends no receipt: a message held or refused by the recipient\'s inbound policy looks the same here. Recipient acknowledgement is separate.' };
+/**
+ * Writes one message line to a session inbox socket.
+ * A failure before the connection opens rejects with `noSocket` (nothing was written, another
+ * transport may be tried). A failure after it stays uncertain and must not be resent.
+ */
+export function sendClaudeSocket(path, sessionId, body, { timeoutMs = 5_000 } = {}) {
+  // session_id makes Claude Code drop the line if the pid now belongs to a different session.
+  const line = JSON.stringify({ type: 'user', session_id: sessionId, message: { role: 'user', content: body } }) + '\n';
+  return new Promise((resolve, reject) => {
+    let connected = false, flushed = false, settled = false;
+    const socket = connect(path);
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.destroy();
+      fn(value);
+    };
+    const uncertain = why => new Error(`Inbox socket ${why} after the connection opened; the message may have been read. Do not resend.`);
+    const timer = setTimeout(() => {
+      if (flushed) finish(resolve, SOCKET_RECEIPT);
+      else if (connected) finish(reject, uncertain('timed out'));
+      else finish(reject, Object.assign(new Error('Inbox socket did not answer.'), { noSocket: true }));
+    }, timeoutMs);
+    socket.on('data', () => {});
+    socket.once('connect', () => {
+      connected = true;
+      socket.end(line, 'utf8', () => { flushed = true; });
+    });
+    socket.once('error', error => finish(reject, connected ? uncertain(`failed (${error.code || error.message})`) : Object.assign(error, { noSocket: true })));
+    socket.once('close', () => finish(flushed ? resolve : reject, flushed ? SOCKET_RECEIPT : uncertain('closed early')));
+  });
+}
+const notWoken = (message, code) => Object.assign(new Error(message), { notSent: true, code });
 export async function sendClaude(message) {
   const target = address(message.to);
-  let sessions;
-  try { ({ sessions } = await listSessions({ provider: 'claude', limit: 100 })); }
-  catch (e) { e.notSent = true; throw e; }
-  const found = sessions.find(s => s.address === target.address);
-  if (!found || !found.name) throw Object.assign(new Error('Target Claude session is not live or has no addressable name.'), { notSent: true });
-  if (sessions.filter(s => s.name === found.name).length !== 1) throw Object.assign(new Error('Target Claude name is ambiguous; give the session a unique name.'), { notSent: true });
+  let rows;
+  try { rows = await claudeRows(); }
+  catch (e) { throw Object.assign(e, { notSent: true, code: 'wake_discovery_failed' }); }
+  const found = rows.find(r => r.sessionId.toLowerCase() === target.id);
+  if (!found) throw notWoken('Target Claude session is not running.', 'wake_not_live');
   const body = envelope(message);
+  if (process.env.CLAUDE_CODEX_LINK_CLAUDE_TRANSPORT !== 'courier') {
+    const path = claudeSocketPath(found.pid);
+    if (path) {
+      try { return await sendClaudeSocket(path, target.id, body); }
+      catch (e) { if (!e.noSocket) throw e; }
+    }
+  }
+  // Fallback for a session without a usable socket: a model courier that calls SendMessage by name.
+  if (!found.name) throw notWoken('Target Claude session has no inbox socket and no addressable name.', 'wake_no_route');
+  if (rows.filter(r => r.name === found.name).length !== 1) throw notWoken('Target Claude name is ambiguous; give the session a unique name.', 'wake_ambiguous_name');
   const prompt = JSON.stringify({ recipient_name: found.name, message: body });
   const delays = courierRetryDelays();
   for (let attempt = 0; ; attempt++) {

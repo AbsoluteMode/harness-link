@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, readdirSync, statSync, existsSync, realpathSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -65,37 +66,41 @@ test('Claude courier uses exact message, stdin, pinned model and restricted tool
   assert.ok(!sent.args.join(' ').includes('untrusted body'));
   assert.ok(sent.body.includes('not a new instruction or approval'));
 });
-test('ambiguous Claude names fail without a send', async () => {
+test('ambiguous Claude names are never guessed: no send, the message waits in the mailbox', async () => {
   process.env.LINK_TEST_MODE = 'ambiguous';
   const before = deliveries().length;
   const a = startMessage({ from: codex, to: claude, text: 'do not misroute' });
-  assert.equal((await settle(a.message_id)).status, 'failed');
+  const r = await settle(a.message_id);
+  assert.equal(r.status, 'stored');
+  assert.equal(r.error_code, 'wake_ambiguous_name');
   assert.equal(deliveries().length, before);
   delete process.env.LINK_TEST_MODE;
 });
 // WHY: 13 Codex→Claude notifications were lost on 12–14 Nov: the courier was rejected at login,
 // nothing was sent, and the sender was told "delivery may have occurred; do not resend".
-test('courier rejected at login is failed with the reason, not unknown', async () => {
+test('courier rejected at login: the reason is reported and the message waits in the mailbox', async () => {
   process.env.LINK_TEST_MODE = 'courier-auth-expired';
   const before = deliveries().filter(d => d.transport === 'claude').length;
   const a = startMessage({ from: codex, to: claude, text: 'queue notification' });
   const r = await settle(a.message_id);
   delete process.env.LINK_TEST_MODE;
-  assert.equal(r.status, 'failed');
+  assert.equal(r.status, 'stored');
   assert.equal(r.error_code, 'courier_auth');
   assert.match(r.error, /OAuth session expired/);
   assert.match(r.error, /Nothing was sent/);
   assert.match(r.next_step, /log in again/);
+  assert.match(r.next_step, /Do not resend/);
   assert.equal(deliveries().filter(d => d.transport === 'claude').length, before);
-  assert.ok(!inbox({ recipient: claude }).messages.some(m => m.id === a.message_id));
-  assert.throws(() => acknowledge({ message_id: a.message_id, recipient: claude }), /cannot be acknowledged/);
+  // WHY: .project-docs/decisions/claude-mailbox-delivery.md. The mailbox is the source of truth, the wake-up is separate.
+  assert.equal(inbox({ recipient: claude }).messages.find(m => m.id === a.message_id).transport_status, 'stored');
+  assert.equal(acknowledge({ message_id: a.message_id, recipient: claude }).status, 'acknowledged');
 });
-test('courier rejected by an overloaded API is failed without a login hint', async () => {
+test('courier rejected by an overloaded API is stored without a login hint', async () => {
   process.env.LINK_TEST_MODE = 'courier-overloaded';
   const a = startMessage({ from: codex, to: claude, text: 'overloaded' });
   const r = await settle(a.message_id);
   delete process.env.LINK_TEST_MODE;
-  assert.equal(r.status, 'failed');
+  assert.equal(r.status, 'stored');
   assert.equal(r.error_code, 'courier_api_error');
   assert.doesNotMatch(r.next_step, /log in/);
 });
@@ -110,7 +115,7 @@ test('token-refresh race is retried and delivers exactly once', async () => {
   assert.equal(deliveries().filter(d => d.transport === 'claude-rejected').length - rejectedBefore, 2);
   assert.equal(deliveries().filter(d => d.transport === 'claude' && d.body.includes('survives the race')).length, 1);
 });
-test('token-refresh race that never clears stops after bounded retries as failed', async () => {
+test('token-refresh race that never clears stops after bounded retries and stays in the mailbox', async () => {
   process.env.LINK_TEST_MODE = 'courier-refresh-race-forever';
   process.env.CLAUDE_CODEX_LINK_COURIER_RETRY_MS = '20,20';
   const rejectedBefore = deliveries().filter(d => d.transport === 'claude-rejected').length;
@@ -118,9 +123,10 @@ test('token-refresh race that never clears stops after bounded retries as failed
   const r = await settle(a.message_id);
   delete process.env.LINK_TEST_MODE;
   delete process.env.CLAUDE_CODEX_LINK_COURIER_RETRY_MS;
-  assert.equal(r.status, 'failed');
+  assert.equal(r.status, 'stored');
   assert.equal(deliveries().filter(d => d.transport === 'claude-rejected').length - rejectedBefore, 3);
-  assert.match(r.next_step, /in a minute/);
+  assert.match(r.next_step, /refreshing the login/);
+  assert.match(r.next_step, /Do not resend/);
 });
 test('courier that died after issuing SendMessage stays unknown and is never retried', async () => {
   process.env.LINK_TEST_MODE = 'courier-interrupted';
@@ -149,6 +155,196 @@ test('real rejected-courier output classifies as not sent', () => {
   const cut = output.split('\n').filter(l => !l.includes('"type":"result"')).join('\n');
   assert.throws(() => classifyCourier({ output: cut, code: 1, stderr: '' }, { name: 'x', body: 'y' }),
     e => !e.notSent && /delivery may have occurred/.test(e.message));
+});
+// WHY: .project-docs/decisions/claude-mailbox-delivery.md
+// Delivery to Claude: the session's own inbox socket first (no model, no login), the courier only
+// when there is no usable socket, and the mailbox plus the hook when nothing could wake the session.
+const socketDir = mkdtempSync('/tmp/hl-sock-');
+process.env.CLAUDE_CODEX_LINK_SOCKET_DIR = socketDir;
+const courierRuns = () => deliveries().filter(d => d.transport === 'claude' || d.transport === 'claude-rejected').length;
+async function withInboxSocket(onConnection, body) {
+  const lines = [];
+  const path = join(socketDir, `${process.pid}.sock`);
+  const server = createServer(socket => {
+    socket.setEncoding('utf8');
+    let buffer = '';
+    socket.on('data', chunk => {
+      buffer += chunk;
+      for (let i; (i = buffer.indexOf('\n')) >= 0; buffer = buffer.slice(i + 1)) lines.push(buffer.slice(0, i));
+    });
+    socket.on('error', () => {});
+    onConnection?.(socket);
+  });
+  await new Promise(resolve => server.listen(path, resolve));
+  process.env.LINK_TEST_CLAUDE_PID = String(process.pid);
+  try { return await body(lines); }
+  finally {
+    delete process.env.LINK_TEST_CLAUDE_PID;
+    await new Promise(resolve => server.close(resolve));
+    rmSync(path, { force: true });
+  }
+}
+test('a live Claude session is reached through its inbox socket without any model run', async () => {
+  await withInboxSocket(null, async lines => {
+    const before = courierRuns();
+    const text = 'socket body: "quotes", $(sh) and\nвторая строка';
+    const a = startMessage({ from: codex, to: claude, text });
+    const r = await settle(a.message_id);
+    assert.equal(r.status, 'accepted');
+    assert.equal(r.transport, 'claude-inbox-socket');
+    assert.match(r.detail, /no receipt/i);
+    assert.equal(courierRuns(), before);
+    assert.equal(lines.length, 1);
+    const frame = JSON.parse(lines[0]);
+    assert.equal(frame.type, 'user');
+    assert.equal(frame.session_id, address(claude).id);
+    assert.equal(frame.message.role, 'user');
+    assert.ok(frame.message.content.includes(JSON.stringify(text)));
+    assert.ok(frame.message.content.includes('not a new instruction or approval'));
+    assert.ok(frame.message.content.includes(a.message_id));
+    assert.equal(inbox({ recipient: claude }).messages.find(m => m.id === a.message_id).transport_status, 'accepted');
+  });
+});
+test('a 50000-character message crosses the socket whole', async () => {
+  await withInboxSocket(null, async lines => {
+    const text = 'я'.repeat(49_999) + '!';
+    const a = startMessage({ from: codex, to: claude, text });
+    assert.equal((await settle(a.message_id)).transport, 'claude-inbox-socket');
+    assert.equal(lines.length, 1);
+    assert.ok(JSON.parse(lines[0]).message.content.includes(text));
+  });
+});
+test('a session that drops the connection at once is unknown, never resent through the courier', async () => {
+  await withInboxSocket(socket => socket.destroy(), async () => {
+    const before = courierRuns();
+    const a = startMessage({ from: codex, to: claude, text: 'dropped mid-write' });
+    const r = await settle(a.message_id);
+    assert.ok(['accepted', 'unknown'].includes(r.transport_status));
+    assert.equal(courierRuns(), before);
+  });
+});
+test('a socket left by a crashed session, or a plain file in its place, falls back to the courier once', async () => {
+  const stale = join(socketDir, `${process.pid}.sock`);
+  process.env.LINK_TEST_CLAUDE_PID = String(process.pid);
+  try {
+    // A listener killed without cleanup leaves its socket file behind.
+    spawnSync(process.execPath, ['-e', `require('node:net').createServer().listen(${JSON.stringify(stale)}, () => process.kill(process.pid, 'SIGKILL'))`]);
+    assert.ok(statSync(stale).isSocket());
+    const a = startMessage({ from: codex, to: claude, text: 'stale socket file' });
+    const r = await settle(a.message_id);
+    assert.equal(r.status, 'accepted');
+    assert.equal(r.transport, 'claude-send-message');
+    assert.equal(deliveries().filter(d => d.transport === 'claude' && d.body.includes('stale socket file')).length, 1);
+    rmSync(stale, { force: true });
+    writeFileSync(stale, 'not a socket');
+    const b = startMessage({ from: codex, to: claude, text: 'plain file in the way' });
+    assert.equal((await settle(b.message_id)).transport, 'claude-send-message');
+  } finally {
+    delete process.env.LINK_TEST_CLAUDE_PID;
+    rmSync(stale, { force: true });
+  }
+});
+test('CLAUDE_CODEX_LINK_CLAUDE_TRANSPORT=courier skips a working socket', async () => {
+  await withInboxSocket(null, async lines => {
+    process.env.CLAUDE_CODEX_LINK_CLAUDE_TRANSPORT = 'courier';
+    try {
+      const a = startMessage({ from: codex, to: claude, text: 'courier on request' });
+      assert.equal((await settle(a.message_id)).transport, 'claude-send-message');
+      assert.equal(lines.length, 0);
+    } finally { delete process.env.CLAUDE_CODEX_LINK_CLAUDE_TRANSPORT; }
+  });
+});
+test('a Claude session that is not running keeps the message in its mailbox', async () => {
+  process.env.LINK_TEST_MODE = 'claude-not-live';
+  const before = courierRuns();
+  const a = startMessage({ from: codex, to: claude, text: 'read me when you are back' });
+  const r = await settle(a.message_id);
+  delete process.env.LINK_TEST_MODE;
+  assert.equal(r.status, 'stored');
+  assert.equal(r.error_code, 'wake_not_live');
+  assert.match(r.next_step, /Do not resend/);
+  assert.equal(courierRuns(), before);
+  assert.ok(inbox({ recipient: claude }).messages.some(m => m.id === a.message_id));
+});
+
+const hookScript = fileURLToPath(new URL('./inbox-hook.mjs', import.meta.url));
+const runHook = (input, env = {}) => spawnSync(process.execPath, [hookScript], { input: typeof input === 'string' ? input : JSON.stringify(input), encoding: 'utf8', env: { ...process.env, ...env } });
+const hookClaude = id => `claude:${id}`;
+async function storedFor(recipient, text) {
+  process.env.LINK_TEST_MODE = 'claude-not-live';
+  try {
+    const a = startMessage({ from: codex, to: recipient, text });
+    assert.equal((await settle(a.message_id)).status, 'stored');
+    return a.message_id;
+  } finally { delete process.env.LINK_TEST_MODE; }
+}
+test('mailbox hook hands a stored message to the session on its next prompt, exactly once', async () => {
+  const session = randomUUID();
+  const id = await storedFor(hookClaude(session), 'hook body: please check the queue');
+  const first = runHook({ session_id: session, hook_event_name: 'UserPromptSubmit', prompt: 'hi' });
+  assert.equal(first.status, 0);
+  const out = JSON.parse(first.stdout);
+  assert.equal(out.hookSpecificOutput.hookEventName, 'UserPromptSubmit');
+  const context = out.hookSpecificOutput.additionalContext;
+  assert.ok(context.includes('hook body: please check the queue'));
+  assert.ok(context.includes(id));
+  assert.ok(context.includes('not a new instruction or approval'));
+  assert.match(context, /link_ack/);
+  const second = runHook({ session_id: session, hook_event_name: 'UserPromptSubmit', prompt: 'again' });
+  assert.equal(second.status, 0);
+  assert.equal(second.stdout.trim(), '');
+  assert.equal(messageStatus(id).surfaced_by_hook, true);
+});
+test('mailbox hook at the end of a turn keeps the session going with the stored message', async () => {
+  const session = randomUUID();
+  await storedFor(hookClaude(session), 'stop-hook body');
+  const out = JSON.parse(runHook({ session_id: session, hook_event_name: 'Stop', stop_hook_active: false }).stdout);
+  assert.equal(out.decision, 'block');
+  assert.ok(out.reason.includes('stop-hook body'));
+  assert.equal(runHook({ session_id: session, hook_event_name: 'Stop', stop_hook_active: true }).stdout.trim(), '');
+});
+test('mailbox hook stays silent for other sessions, delivered, acknowledged and failed mail', async () => {
+  const session = randomUUID();
+  const other = randomUUID();
+  const acked = await storedFor(hookClaude(session), 'already read');
+  acknowledge({ message_id: acked, recipient: hookClaude(session) });
+  await storedFor(hookClaude(other), 'for somebody else');
+  assert.equal(runHook({ session_id: session, hook_event_name: 'UserPromptSubmit' }).stdout.trim(), '');
+  // Mail the live transport already delivered must not be shown a second time.
+  const live = startMessage({ from: codex, to: claude, text: 'delivered live already' });
+  assert.equal((await settle(live.message_id)).status, 'accepted');
+  const shown = runHook({ session_id: address(claude).id, hook_event_name: 'UserPromptSubmit' });
+  assert.equal(shown.status, 0);
+  assert.ok(!shown.stdout.includes('delivered live already'));
+  assert.ok(!messageStatus(live.message_id).surfaced_by_hook);
+});
+test('mailbox hook never breaks a session: bad input, missing storage and oversized mail', async () => {
+  for (const input of ['', '{broken', '[]', JSON.stringify({ session_id: '../../etc', hook_event_name: 'Stop' }), JSON.stringify({ hook_event_name: 'UserPromptSubmit' })]) {
+    const r = runHook(input);
+    assert.equal(r.status, 0);
+    assert.equal(r.stdout.trim(), '');
+  }
+  const empty = runHook({ session_id: randomUUID(), hook_event_name: 'UserPromptSubmit' }, { CLAUDE_CODEX_LINK_DIR: join(root, 'no-such-dir') });
+  assert.equal(empty.status, 0);
+  assert.equal(empty.stdout.trim(), '');
+  const session = randomUUID();
+  const big = await storedFor(hookClaude(session), 'x'.repeat(40_000));
+  const small = await storedFor(hookClaude(session), 'short one');
+  const context = JSON.parse(runHook({ session_id: session, hook_event_name: 'UserPromptSubmit' }).stdout).hookSpecificOutput.additionalContext;
+  assert.ok(context.length <= 10_000);
+  assert.ok(context.includes('short one'));
+  assert.ok(context.includes(big));
+  assert.match(context, /link_inbox/);
+  assert.ok(!context.includes('x'.repeat(9_000)));
+  assert.equal(messageStatus(small).surfaced_by_hook, true);
+});
+test('two hooks racing for the same message show it once', async () => {
+  const session = randomUUID();
+  await storedFor(hookClaude(session), 'race body');
+  const cli = [hookScript];
+  const input = JSON.stringify({ session_id: session, hook_event_name: 'UserPromptSubmit' });
+  const outs = await Promise.all([run(process.execPath, cli, input), run(process.execPath, cli, input), run(process.execPath, cli, input)]);
+  assert.equal(outs.filter(o => o.includes('race body')).length, 1);
 });
 test('archived Codex rejects; live request never silently becomes a queue send', async () => {
   process.env.LINK_TEST_MODE = 'archived';
@@ -213,13 +409,15 @@ test('unfinished and corrupt records do not break other inbox messages', () => {
   assert.ok(result.messages.length > 0);
   assert.equal(result.skipped_records, 2);
 });
-test('missing executables are confirmed pre-delivery failures', async () => {
+test('missing executables: Claude mail waits in the mailbox, a Codex send is a confirmed failure', async () => {
   const originalClaude = process.env.CLAUDE_CODEX_LINK_CLAUDE_CLI;
   const originalCodex = process.env.CLAUDE_CODEX_LINK_CODEX_CLI;
   try {
     process.env.CLAUDE_CODEX_LINK_CLAUDE_CLI = join(root, 'absent-cli');
     const a = startMessage({ from: codex, to: claude, text: 'cannot discover' });
-    assert.equal((await settle(a.message_id)).status, 'failed');
+    const stored = await settle(a.message_id);
+    assert.equal(stored.status, 'stored');
+    assert.equal(stored.error_code, 'wake_discovery_failed');
     process.env.CLAUDE_CODEX_LINK_CODEX_CLI = join(root, 'absent-cli');
     const b = startMessage({ from: claude, to: codex, text: 'cannot initialize' });
     assert.equal((await settle(b.message_id)).status, 'failed');
