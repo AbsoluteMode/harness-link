@@ -109,4 +109,4 @@ recipient's inbox.
 - **Managed Claude workers (`link_open_claude`):** a new feature, not a fix for
   delivery; left for later.
 
-2026-11-19. Not yet committed or released.
+2026-11-19. Released as 0.9.0: https://github.com/AbsoluteMode/harness-link/pull/11
