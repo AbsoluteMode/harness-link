@@ -34,10 +34,10 @@ Create a shared chat with `link_open_room`. Use `link_rooms`,
    to receipts or create message loops.
 
 Claude messaging requires a live, uniquely named session and respects inbound
-permissions. Codex Desktop wake-up from an external process is unavailable in
-this version. Use `delivery: queue` only when deferred delivery is acceptable;
-`live` fails explicitly. Never resume a live session in a second process merely
-to deliver a message. Never modify session logs or bypass an access refusal.
+permissions. A message wakes an idle Codex chat, and Codex's final answer
+returns to `reply_to` as a reply notification. A chat running a turn is only
+queued; `live` then refuses. Never resume a session in a second process
+yourself. Never modify session logs or bypass an access refusal.
 
 ## Gemini 4 Carbon
 

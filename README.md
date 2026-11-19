@@ -4,10 +4,10 @@ Share one conversation between Codex, Claude Code, and Antigravity, send
 addressed messages to existing sessions, and run persistent Claude consultations. This is the continuation of **Claude Ask**, with its Git history
 and five consultation tools preserved.
 
-**Delivery is asymmetric:** Claude receives messages in its live session.
-Codex receives a persistent queued message on a subsequent turn. Version 0.4.0
-does **not** wake an idle Codex Desktop chat from an external process. A request
-for live Codex delivery fails explicitly instead of silently queueing.
+**Delivery:** Claude receives messages in its live session. A message to Codex
+is written to the chat's queue; an idle chat is then loaded by Harness Link,
+Codex runs the message, and its final answer is delivered to the sender. A chat
+that is running a turn is only queued and takes the message afterwards.
 
 ## Install
 
@@ -123,7 +123,7 @@ model for every turn.
    turn; messages to one conversation run one after another.
 3. When the turn ends, Harness Link delivers Carbon's response, or the reason it
    failed, to `reply_to` as a reply notification over that session's normal
-   transport (Claude live inbox, Codex queue). You do not need to poll. Pass
+   transport (Claude live inbox, Codex queue and wake-up). You do not need to poll. Pass
    `notify: false` to turn this off for one message.
 4. While it runs, `link_status` shows `progress`: the attempt, the number of
    tool steps and Carbon's last actions (command, file). Either client can
@@ -202,7 +202,14 @@ authority. Native Antigravity Desktop conversations are outside this transport.
 - `accepted`: the message was written to Claude's inbox socket (or the courier's SendMessage was accepted), or Carbon returned a response. Claude Code sends no receipt for a socket write: a message its inbound policy holds or refuses looks the same. Reading remains unconfirmed.
 - `stored`: mail for Claude that is saved in the recipient's mailbox but could not wake the session (not running, no route, courier rejected). The recipient gets it from the plugin hook on its next turn or with `link_inbox`. Do not resend. `error_code` gives the reason (`wake_not_live`, `wake_no_route`, `wake_ambiguous_name`, `wake_discovery_failed`, `courier_auth`, `courier_api_error`).
 - `error` / `cancelled`: a Carbon turn started and ended without a response; see `error_code` and `next_step`.
-- `queued`: Codex persisted the message; execution and reading are unconfirmed.
+- `queued`: Codex persisted the message but no turn was observed: the chat was
+  running a turn, wake-up is off, or Codex could not load it. `detail` says which.
+- `accepted` with transport `codex-wake`: Harness Link loaded the idle chat and
+  Codex finished the turn for the message; `response` holds its final answer,
+  which is also delivered to `reply_to`. `codex-queue` means a Codex process
+  that already had the chat ran it. `error` with `codex_turn_failed`,
+  `codex_turn_interrupted` or `codex_turn_timeout` (60 minutes): the turn ended
+  without an answer.
 - `acknowledged`: the addressed recipient reported reading it; work may remain.
 - `failed`: a known pre-delivery rejection for Codex or Carbon, for example an archived Codex thread.
   Mail for Claude is never `failed`; see `stored`.
@@ -213,12 +220,31 @@ An acknowledgement is an agent-reported receipt, not cryptographic identity
 proof. Peer text is marked as agent-authored and carries no new human authority.
 Receiving-session permissions and inbound-message rules still apply.
 
-The bridge never edits transcript or queue databases directly, and never starts
-a second process on an open conversation to force a response. Archived Codex
-targets and ambiguous Claude names are rejected. Claude history contains the
+The bridge never edits transcript or queue databases directly. It loads a Codex
+chat only after waiting for a process that already has it, and never while the
+chat is running a turn; see "Waking Codex" below. Archived Codex targets and
+ambiguous Claude names are rejected. Claude history contains the
 latest saved user/assistant text, excluding tool output and thinking. Codex
 history supports cursors. Separate app-server runtime status is not Desktop
 activity status.
+
+## Waking Codex
+
+After queueing, Harness Link waits 15 seconds for a Codex process that already
+has the chat (Codex Desktop) to take the message. If none does, the message
+runner loads the chat in its own `codex app-server`, lets Codex run the queue,
+and stays until the turn for the message ends. One runner at a time per chat.
+
+- The turn uses the chat's saved sandbox and approval settings; a step that
+  needs approval is refused, because nobody is there to answer.
+- Codex is told that its final message is delivered to `reply_to`, so it should
+  answer there instead of calling `link_send`.
+- `delivery: live` refuses, without queueing, when the chat is running a turn
+  or this Codex cannot wake a chat.
+- If Codex Desktop has the chat open and idle but does not take the message,
+  the turn runs in the runner's process. Desktop may show it only after the
+  chat is reloaded; avoid typing in that chat during the turn.
+- `CLAUDE_CODEX_LINK_CODEX_WAKE=off` keeps the message queued only.
 
 ## Consultations
 
@@ -245,6 +271,9 @@ and 24-hour completed-job retention.
 - `CLAUDE_CODEX_LINK_CODEX_CLI`: Codex executable override.
 - `CLAUDE_CODEX_LINK_AGY_CLI`: Antigravity executable override.
 - `CLAUDE_CODEX_LINK_TURN_MINUTE_MS`: test-only length of a turn-timeout minute.
+- `CLAUDE_CODEX_LINK_CODEX_WAKE=off`: queue messages to Codex without waking the chat.
+- `CLAUDE_CODEX_LINK_CODEX_GRACE_MS`: how long to wait for another Codex process
+  to take a queued message before loading the chat (default 15000).
 - Existing `CLAUDE_ASK_*` settings continue to configure consultations.
 
 - `CLAUDE_CODEX_LINK_CLAUDE_TRANSPORT=courier`: skip the inbox socket and use the courier.
@@ -267,7 +296,8 @@ npm test
 
 Default tests use fake executables and consume no model usage. They cover
 consultation recovery, exact model selection, message idempotency, receipt loss,
-wrong-recipient acknowledgements, ambiguous names, archived targets, and Carbon
+wrong-recipient acknowledgements, ambiguous names, archived targets, Codex
+wake-up (idle, running, paused queue, another process, failures), and Carbon
 turns: progress, journal, agy failures, a killed runner, cancel, timeout,
 denied tool calls, reply delivery without loops, the outbox, and an MCP server
 restart mid-turn.

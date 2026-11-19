@@ -1,4 +1,6 @@
 # Open questions
 
-- A supported external transport that wakes an existing Codex Desktop chat is
-  not available to this plugin. Queue acceptance does not establish wake-up.
+- How Codex Desktop behaves when Harness Link loads a chat that Desktop has
+  open and idle: whether Desktop takes the queued message within the grace
+  period, and whether it shows a turn run by the runner without a reload. See
+  [Codex wake-up](decisions/codex-wake.md).

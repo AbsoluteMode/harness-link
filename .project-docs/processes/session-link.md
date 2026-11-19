@@ -6,7 +6,7 @@ summary: Install the renamed plugin and distinguish inbox acceptance from recipi
 status: observed
 tags: [installation, messages, receipts, testing]
 canonical_for: [session-link-operations]
-verified_at: 2026-11-08
+verified_at: 2026-11-20
 sources:
   - type: repository
     reference: plugins/claude-codex-link/scripts/transports.mjs
@@ -17,7 +17,7 @@ sources:
   - type: url
     reference: https://learn.chatgpt.com/docs/app-server
     confirmed_at: 2026-11-08
-related: [../project.md, ../decisions/claude-mailbox-delivery.md, ../decisions/carbon-workspace-modes.md, ../decisions/carbon-worker-turns.md, ../bugs/carbon-midturn-stream-drops.md, ../bugs/courier-rejections-reported-unknown.md]
+related: [../project.md, ../decisions/claude-mailbox-delivery.md, ../decisions/codex-wake.md, ../decisions/carbon-workspace-modes.md, ../decisions/carbon-worker-turns.md, ../bugs/carbon-midturn-stream-drops.md, ../bugs/courier-rejections-reported-unknown.md]
 ---
 
 # Session link operations
@@ -36,9 +36,13 @@ evidence and limits: [Claude mailbox delivery](../decisions/claude-mailbox-deliv
 
 Codex listing, history, and queueing use the installed CLI's app-server JSONL
 protocol. Queue requests include the bridge message UUID as clientUserMessageId.
-They do not start, resume, fork, or interrupt a conversation. An archived target
-is rejected. External Desktop wake-up is unavailable in this version: `live`
-fails without silently queueing. Deferred delivery is the default.
+An archived target is rejected. After queueing, the runner waits for a Codex
+process that already has the chat, then loads an idle chat with `thread/resume`,
+starts a paused queue, watches the turn that holds the message and delivers its
+final answer to `reply_to`. A chat that is running a turn is only queued; `live`
+refuses without queueing when the chat is running or cannot be woken.
+`CLAUDE_CODEX_LINK_CODEX_WAKE=off` restores queue-only delivery. Design,
+evidence and limits: [Codex wake-up](../decisions/codex-wake.md).
 
 Messages and receipts use private files under the `.claude-codex-link` directory in the user home (0700
 directories, 0600 files). They remain until explicitly removed by the owner.
@@ -88,8 +92,9 @@ Run `npm run check` and `npm test`. The default tests use fake executables and
 consume no model usage. For live verification use a disposable Claude receiver
 and an isolated Codex thread; do not use unrelated user conversations.
 
-Never edit transcript or queue databases directly. Never start a second
-headless process over a live Desktop conversation to force delivery.
+Never edit transcript or queue databases directly. A Codex chat is loaded in a
+second process only by the wake-up path, after its grace period and never while
+the chat is running a turn; do not resume a chat by any other means.
 
 ## Verification on 2026-11-08
 
@@ -102,3 +107,11 @@ deferred delivery, not automatic Desktop wake-up.
 A second isolated Claude receiver loaded the MCP server and called `link_ack`;
 the sender observed `acknowledged`. The receiver may acknowledge before the
 courier finishes saving its transport receipt, so both states are retained.
+
+## Verification on 2026-11-20
+
+Codex wake-up was run live against disposable Codex chats with codex-cli
+0.170.0: an idle chat ran the queued message and its answer reached the sending
+Claude session as a reply notification in 26 to 27 seconds. A chat with a queue
+paused by an interrupted turn needed `thread/queue/start`. A chat open in Codex
+Desktop was not tested.

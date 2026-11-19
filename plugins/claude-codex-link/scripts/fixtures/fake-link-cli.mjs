@@ -162,19 +162,60 @@ if (args[0] === '--model') {
   console.log(JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'tool-1', content: JSON.stringify({ success: true, msg_id: 'accepted-1' }) }] } }));
   console.log(JSON.stringify({ type: 'result', modelUsage: { 'claude-opus-5-5': {} }, result: 'sent' }));
 } else {
+  // Codex chat state shared by every fake app-server process of one test mode: the queue and the turns.
+  const mode = process.env.LINK_TEST_MODE || '';
+  const wakeMode = mode.startsWith('codex-');
+  const chatFile = `${process.env.LINK_TEST_DELIVERIES}.${mode}.chat.json`;
+  const chat = () => existsSync(chatFile) ? JSON.parse(readFileSync(chatFile, 'utf8')) : { queue: [], turns: [] };
+  const save = state => writeFileSync(chatFile, JSON.stringify(state));
+  const runQueue = (state, status = 'completed') => {
+    for (const item of state.queue.splice(0)) {
+      state.turns.unshift({ id: `turn-${item.id}`, status, items: [
+        { type: 'userMessage', id: `u-${item.id}`, content: item.input },
+        ...(status === 'completed' ? [{ type: 'agentMessage', id: `a-${item.id}`, text: 'working' }, { type: 'agentMessage', id: `b-${item.id}`, text: `codex answer to ${item.id}` }] : []),
+      ] });
+    }
+  };
+  const reject = (id, message) => console.log(JSON.stringify({ id, error: { code: -32600, message } }));
   for await (const line of createInterface({ input: process.stdin })) {
     const m = JSON.parse(line);
     if (m.id === undefined) continue;
     let result = {};
     if (m.method === 'thread/read') result = { thread: { id: m.params.threadId } };
     if (m.method === 'thread/list') result = { data: [{ id: claudeId, name: 'test', cwd: '/tmp', status: { type: 'notLoaded' } }], nextCursor: null };
+    if (wakeMode && m.method === 'thread/turns/list') {
+      if (mode === 'codex-old') { reject(m.id, 'Method not found.'); continue; }
+      const state = chat();
+      result = { data: mode === 'codex-busy' ? [{ id: 'turn-busy', status: 'inProgress', items: [] }, ...state.turns] : state.turns.slice(0, m.params.limit), nextCursor: null };
+    }
+    if (wakeMode && m.method === 'thread/queue/list') result = { data: chat().queue.map(q => ({ id: q.id, clientUserMessageId: q.id, input: q.input })), nextCursor: null };
+    if (wakeMode && ['thread/resume', 'thread/queue/start', 'turn/interrupt'].includes(m.method)) {
+      record({ transport: 'codex', method: m.method, mode, ...m.params });
+      const state = chat();
+      if (m.method === 'thread/resume' && mode === 'codex-refuses') { reject(m.id, 'Thread cannot be loaded.'); continue; }
+      if (m.method === 'thread/resume' && mode === 'codex-failed') runQueue(state, 'failed');
+      if (m.method === 'thread/resume' && mode === 'codex-hangs') {
+        for (const item of state.queue.splice(0)) state.turns.unshift({ id: `turn-${item.id}`, status: 'inProgress', items: [{ type: 'userMessage', id: `u-${item.id}`, content: item.input }] });
+      }
+      if (m.method === 'thread/resume' && mode === 'codex-wake') runQueue(state);
+      // After an interrupted turn the real queue stays paused until an explicit start.
+      if (m.method === 'thread/queue/start' && mode === 'codex-paused') runQueue(state);
+      save(state);
+    }
     if (m.method === 'thread/queue/add') {
       if (process.env.LINK_TEST_MODE === 'archived') {
-        console.log(JSON.stringify({ id: m.id, error: { code: -32600, message: 'Session is archived.' } })); continue;
+        reject(m.id, 'Session is archived.'); continue;
       }
       record({ transport: 'codex', ...m.params });
       if (process.env.LINK_TEST_MODE === 'disconnect') process.exit(0);
       result = { queuedSubmission: { id: m.params.clientUserMessageId } };
+      if (wakeMode) {
+        const state = chat();
+        state.queue.push({ id: m.params.clientUserMessageId, input: m.params.input });
+        // A Codex process that already has the chat open runs the queue by itself.
+        if (mode === 'codex-desktop') runQueue(state);
+        save(state);
+      }
     }
     console.log(JSON.stringify({ id: m.id, result }));
   }
