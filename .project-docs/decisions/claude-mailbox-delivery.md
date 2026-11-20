@@ -23,7 +23,7 @@ sources:
   - type: trace
     reference: Local Harness Link message journal for 2026-11-08..18, and live runs against disposable Claude Code 2.1.325 sessions on 2026-11-19, described under What was tested.
     confirmed_at: 2026-11-19
-related: [../processes/session-link.md, ../bugs/courier-rejections-reported-unknown.md]
+related: [../processes/session-link.md, codex-wake.md, ../bugs/courier-rejections-reported-unknown.md]
 ---
 
 # Claude delivery through the inbox socket, with the mailbox as the source of truth

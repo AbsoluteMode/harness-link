@@ -24,10 +24,11 @@ function deliverOutbox(message) {
 }
 
 function replyText(message, state) {
+  const agent = address(message.to).provider === 'codex' ? 'Codex' : 'Gemini 4 Carbon';
   if (state.status === 'accepted') {
-    return `Gemini 4 Carbon finished your message ${message.id}.\n\n${state.response}`;
+    return `${agent} finished your message ${message.id}.\n\n${state.response}`;
   }
-  return `Gemini 4 Carbon could not finish your message ${message.id} (${state.error_code || state.status}): ${state.error}` +
+  return `${agent} could not finish your message ${message.id} (${state.error_code || state.status}): ${state.error}` +
     (state.next_step ? `\nNext step: ${state.next_step}` : '') +
     (state.journal ? `\nJournal: ${state.journal}` : '');
 }
@@ -35,8 +36,12 @@ function replyText(message, state) {
 // WHY: .project-docs/decisions/carbon-worker-turns.md
 // A finished Carbon turn is delivered to reply_to over the recipient's normal transport. Reply
 // notifications never produce another notification, so two agents cannot ping-pong automatically.
+// WHY: .project-docs/decisions/codex-wake.md
+// The same holds for a Codex turn this runner watched to its end (a woken chat).
 function notifyReply(message, state) {
-  if (address(message.to).provider !== 'antigravity' || message.kind === 'reply' || message.notify === false) return null;
+  const { provider } = address(message.to);
+  const watchedCodexTurn = provider === 'codex' && state.transport_id && (state.response !== undefined || state.status === 'error');
+  if (!(provider === 'antigravity' || watchedCodexTurn) || message.kind === 'reply' || message.notify === false) return null;
   if (state.status === 'cancelled' || !message.reply_to || message.reply_to === message.to) return null;
   try {
     const reply = startMessage({ message_id: replyMessageId(message.id), from: message.to, to: message.reply_to,
@@ -59,8 +64,7 @@ try {
       deliverOutbox: deliverOutbox(message),
     });
   } else {
-    if (message.delivery === 'live') throw Object.assign(new Error('Live Codex transport is not connected. No message was queued; choose queue explicitly if delayed delivery is acceptable.'), { notSent: true });
-    result = await queueCodex(message);
+    result = await queueCodex(message, { dir: LINK_DIR, onProgress: progress => saveState(id, { ...base, status: 'sending', ...progress }) });
   }
   state = { ...base, ...result, completed_at: new Date().toISOString() };
 } catch (error) {

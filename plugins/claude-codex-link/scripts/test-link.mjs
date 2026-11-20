@@ -14,6 +14,8 @@ process.env.LINK_TEST_DELIVERIES = join(root, 'deliveries.jsonl');
 process.env.CLAUDE_CODEX_LINK_CLAUDE_CLI = fileURLToPath(new URL('./fixtures/fake-link-cli.mjs', import.meta.url));
 process.env.CLAUDE_CODEX_LINK_CODEX_CLI = process.env.CLAUDE_CODEX_LINK_CLAUDE_CLI;
 process.env.CLAUDE_CODEX_LINK_AGY_CLI = process.env.CLAUDE_CODEX_LINK_CLAUDE_CLI;
+// The older tests cover deferred queueing; the Codex wake-up tests turn it on one at a time.
+process.env.CLAUDE_CODEX_LINK_CODEX_WAKE = 'off';
 const { startMessage, messageStatus, acknowledge, inbox, handleLink } = await import('./link.mjs');
 const { listSessions, address, run, classifyCourier } = await import('./transports.mjs');
 const { RpcClient } = await import('./rpc.mjs');
@@ -357,6 +359,124 @@ test('archived Codex rejects; live request never silently becomes a queue send',
   assert.equal(deliveries().length, before);
   assert.ok(!inbox({ recipient: codex }).messages.some(m => [a.message_id, b.message_id].includes(m.id)));
   assert.throws(() => acknowledge({ message_id: b.message_id, recipient: codex }), /cannot be acknowledged/);
+});
+// WHY: .project-docs/decisions/codex-wake.md
+// Scenario: one agent writes to an idle Codex chat and nobody is at the keyboard.
+async function withCodexWake(mode, body, env = {}) {
+  const set = { LINK_TEST_MODE: mode, CLAUDE_CODEX_LINK_CODEX_GRACE_MS: '0', CLAUDE_CODEX_LINK_TURN_MINUTE_MS: '300', ...env };
+  delete process.env.CLAUDE_CODEX_LINK_CODEX_WAKE;
+  for (const [key, value] of Object.entries(set)) process.env[key] = value;
+  try { await body(); }
+  finally {
+    for (const key of Object.keys(set)) delete process.env[key];
+    process.env.CLAUDE_CODEX_LINK_CODEX_WAKE = 'off';
+  }
+}
+const codexCalls = (mode, method) => deliveries().filter(d => d.mode === mode && d.method === method);
+test('an idle Codex chat is woken, runs the message and its answer returns to the sender', async () => {
+  await withCodexWake('codex-wake', async () => {
+    const a = startMessage({ from: claude, to: codex, text: 'please review the plan' });
+    const r = await settle(a.message_id);
+    assert.equal(r.status, 'accepted');
+    assert.equal(r.transport, 'codex-wake');
+    assert.equal(r.response, `codex answer to ${a.message_id}`);
+    assert.equal(codexCalls('codex-wake', 'thread/resume').length, 1);
+    const sent = deliveries().find(d => d.clientUserMessageId === a.message_id).input[0].text;
+    assert.ok(sent.includes('delivers the final message of this turn to reply_to'));
+    const reply = await settle(await waitFor(() => messageStatus(a.message_id).reply_message_id));
+    assert.equal(reply.kind, 'reply');
+    assert.equal(reply.from, codex);
+    assert.equal(reply.to, claude);
+    assert.equal(reply.in_reply_to, a.message_id);
+    assert.ok(inbox({ recipient: claude }).messages.find(m => m.id === reply.message_id).text.includes(`codex answer to ${a.message_id}`));
+    assert.equal(acknowledge({ message_id: a.message_id, recipient: codex }).status, 'acknowledged');
+  });
+});
+test('a reply notification wakes Codex too, and its turn never produces another notification', async () => {
+  await withCodexWake('codex-wake', async () => {
+    const a = startMessage({ from: claude, to: codex, text: 'finished your request', kind: 'reply', in_reply_to: randomUUID() });
+    const r = await settle(a.message_id);
+    assert.equal(r.status, 'accepted');
+    await new Promise(resolve => setTimeout(resolve, 150));
+    assert.equal(messageStatus(a.message_id).reply_message_id, undefined);
+  });
+});
+test('two messages to one Codex chat are run one after another by a single loaded process at a time', async () => {
+  await withCodexWake('codex-wake', async () => {
+    const a = startMessage({ from: claude, to: codex, text: 'first' }), b = startMessage({ from: claude, to: codex, text: 'second' });
+    const [ra, rb] = [await settle(a.message_id), await settle(b.message_id)];
+    assert.equal(ra.response, `codex answer to ${a.message_id}`);
+    assert.equal(rb.response, `codex answer to ${b.message_id}`);
+    assert.ok(!existsSync(join(root, 'codex', address(codex).id, 'wake.lock')));
+  });
+});
+test('a chat that another Codex process already runs is not loaded a second time', async () => {
+  await withCodexWake('codex-desktop', async () => {
+    const a = startMessage({ from: claude, to: codex, text: 'desktop has this chat open' });
+    const r = await settle(a.message_id);
+    assert.equal(r.status, 'accepted');
+    assert.equal(r.transport, 'codex-queue');
+    assert.equal(r.response, `codex answer to ${a.message_id}`);
+    assert.equal(codexCalls('codex-desktop', 'thread/resume').length, 0);
+  }, { CLAUDE_CODEX_LINK_CODEX_GRACE_MS: '5000' });
+});
+test('a Codex chat that is running a turn is not woken; live refuses instead of queueing', async () => {
+  await withCodexWake('codex-busy', async () => {
+    const a = startMessage({ from: claude, to: codex, text: 'wait for the turn' });
+    const r = await settle(a.message_id);
+    assert.equal(r.status, 'queued');
+    assert.match(r.detail, /running a turn/);
+    assert.equal(codexCalls('codex-busy', 'thread/resume').length, 0);
+    // Only Codex calls are counted: reply notifications of earlier tests reach Claude late.
+    const codexSent = () => deliveries().filter(d => d.transport === 'codex').length;
+    const before = codexSent();
+    const b = startMessage({ from: claude, to: codex, text: 'now or never', delivery: 'live' });
+    const live = await settle(b.message_id);
+    assert.equal(live.status, 'failed');
+    assert.match(live.error, /running a turn/);
+    assert.equal(codexSent(), before);
+  });
+});
+test('a queue paused after an interrupted turn is started explicitly', async () => {
+  await withCodexWake('codex-paused', async () => {
+    const a = startMessage({ from: claude, to: codex, text: 'paused queue' });
+    const r = await settle(a.message_id);
+    assert.equal(r.status, 'accepted');
+    const start = codexCalls('codex-paused', 'thread/queue/start');
+    assert.equal(start.length, 1);
+    assert.equal(start[0].queuedSubmissionId, a.message_id);
+  });
+});
+test('Codex wake-up failures: a failed turn, a turn past the limit, a chat that will not load, an older Codex', async () => {
+  await withCodexWake('codex-failed', async () => {
+    const a = startMessage({ from: claude, to: codex, text: 'this turn fails' });
+    const r = await settle(a.message_id);
+    assert.equal(r.status, 'error');
+    assert.equal(r.error_code, 'codex_turn_failed');
+    const reply = await settle(await waitFor(() => messageStatus(a.message_id).reply_message_id));
+    assert.ok(inbox({ recipient: claude }).messages.find(m => m.id === reply.message_id).text.includes('could not finish'));
+  });
+  await withCodexWake('codex-hangs', async () => {
+    const a = startMessage({ from: claude, to: codex, text: 'never ends' });
+    const r = await settle(a.message_id, 10_000);
+    assert.equal(r.status, 'error');
+    assert.equal(r.error_code, 'codex_turn_timeout');
+    assert.equal(codexCalls('codex-hangs', 'turn/interrupt').length, 1);
+  }, { CLAUDE_CODEX_LINK_TURN_MINUTE_MS: '20' });
+  await withCodexWake('codex-refuses', async () => {
+    const r = await settle(startMessage({ from: claude, to: codex, text: 'cannot load' }).message_id);
+    assert.equal(r.status, 'queued');
+    assert.match(r.detail, /refused to load/);
+    assert.equal(r.reply_message_id, undefined);
+  });
+  await withCodexWake('codex-old', async () => {
+    const a = startMessage({ from: claude, to: codex, text: 'old codex' });
+    const r = await settle(a.message_id);
+    assert.equal(r.status, 'queued');
+    assert.ok(deliveries().find(d => d.clientUserMessageId === a.message_id).input[0].text.includes('Reply only when the human has authorized'));
+    const live = await settle(startMessage({ from: claude, to: codex, text: 'old codex live', delivery: 'live' }).message_id);
+    assert.equal(live.status, 'failed');
+  });
 });
 test('lost receipt is unknown and retry does not deliver twice', async () => {
   process.env.LINK_TEST_MODE = 'disconnect';
