@@ -427,12 +427,14 @@ test('a Codex chat that is running a turn is not woken; live refuses instead of 
     assert.equal(r.status, 'queued');
     assert.match(r.detail, /running a turn/);
     assert.equal(codexCalls('codex-busy', 'thread/resume').length, 0);
-    const before = deliveries().length;
+    // Only Codex calls are counted: reply notifications of earlier tests reach Claude late.
+    const codexSent = () => deliveries().filter(d => d.transport === 'codex').length;
+    const before = codexSent();
     const b = startMessage({ from: claude, to: codex, text: 'now or never', delivery: 'live' });
     const live = await settle(b.message_id);
     assert.equal(live.status, 'failed');
     assert.match(live.error, /running a turn/);
-    assert.equal(deliveries().length, before);
+    assert.equal(codexSent(), before);
   });
 });
 test('a queue paused after an interrupted turn is started explicitly', async () => {
