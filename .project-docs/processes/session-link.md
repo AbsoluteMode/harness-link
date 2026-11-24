@@ -6,7 +6,7 @@ summary: Install the renamed plugin and distinguish inbox acceptance from recipi
 status: observed
 tags: [installation, messages, receipts, testing]
 canonical_for: [session-link-operations]
-verified_at: 2026-11-20
+verified_at: 2026-11-24
 sources:
   - type: repository
     reference: plugins/claude-codex-link/scripts/transports.mjs
@@ -17,7 +17,7 @@ sources:
   - type: url
     reference: https://learn.chatgpt.com/docs/app-server
     confirmed_at: 2026-11-08
-related: [../project.md, ../decisions/claude-mailbox-delivery.md, ../decisions/codex-wake.md, ../decisions/carbon-workspace-modes.md, ../decisions/carbon-worker-turns.md, ../bugs/carbon-midturn-stream-drops.md, ../bugs/courier-rejections-reported-unknown.md]
+related: [../project.md, ../decisions/antigravity-model-choice.md, ../decisions/claude-mailbox-delivery.md, ../decisions/codex-wake.md, ../decisions/carbon-workspace-modes.md, ../decisions/carbon-worker-turns.md, ../bugs/carbon-midturn-stream-drops.md, ../bugs/courier-rejections-reported-unknown.md]
 ---
 
 # Session link operations
@@ -56,10 +56,15 @@ A recipient acknowledgement is reported by the calling agent, not cryptographic
 proof of its identity or proof that the requested work is complete.
 
 A Link-managed Antigravity conversation has an `antigravity:<UUID>` address.
-Its first send starts the native CLI conversation with `gemini-4-carbon-high`.
+Its first send starts the native CLI conversation with the conversation's
+model: `gemini-4-neon-high` by default, or the `model` given to
+`link_open_antigravity` (short name or full id from `agy models`, checked at
+open). Records from before 0.11.0 have no model and keep `gemini-4-carbon-high`.
+Choice, validation and migration:
+[Antigravity model choice](../decisions/antigravity-model-choice.md).
 Subsequent sends resume the saved native ID under an exclusive per-conversation
-lock; messages wait while an earlier turn runs. `link_status` includes Carbon's
-response, the model verified from the CLI initialization event, live
+lock; messages wait while an earlier turn runs. `link_status` includes the
+response, `conversation_model`, the model verified from the CLI initialization event, live
 `progress`, and on failure `error_code`, `next_step`, `journal` and
 `stderr_tail`. The finished turn is delivered to `reply_to` as a `kind: reply`
 message, which never triggers another notification. `link_cancel` stops a turn.

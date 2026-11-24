@@ -2,7 +2,7 @@ import { existsSync } from 'node:fs';
 import { uptime } from 'node:os';
 import { join } from 'node:path';
 import { LINK_DIR, loadMessage, messagePath, messageStatus, saveState, startMessage } from './link.mjs';
-import { replyMessageId, sendAntigravity } from './antigravity.mjs';
+import { getAntigravity, replyMessageId, sendAntigravity } from './antigravity.mjs';
 import { postToRoom } from './rooms.mjs';
 import { address, queueCodex, sendClaude } from './transports.mjs';
 
@@ -10,7 +10,7 @@ const id = process.argv[2];
 const STORED_NEXT_STEP = 'The message is saved in the recipient\'s mailbox and the session was not woken. It receives it from the Harness Link hook on its next turn, or by calling link_inbox. Do not resend it.';
 const base = { pid: process.pid, boot_started_at: Date.now() - uptime() * 1000 };
 
-// Carbon's outbox: the sender identity is always the conversation itself.
+// The Antigravity conversation's outbox: the sender identity is always the conversation itself.
 function deliverOutbox(message) {
   return item => {
     if (item.room_id) {
@@ -24,7 +24,10 @@ function deliverOutbox(message) {
 }
 
 function replyText(message, state) {
-  const agent = address(message.to).provider === 'codex' ? 'Codex' : 'Gemini 4 Carbon';
+  let agent = 'Codex';
+  if (address(message.to).provider === 'antigravity') {
+    try { agent = getAntigravity(LINK_DIR, message.to).model_label; } catch { agent = 'Antigravity'; }
+  }
   if (state.status === 'accepted') {
     return `${agent} finished your message ${message.id}.\n\n${state.response}`;
   }

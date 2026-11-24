@@ -560,7 +560,8 @@ test('Claude and Codex share one Carbon conversation across detached runners', a
   assert.equal(startMessage(payload).duplicate, true);
   const reply = await settle(first.message_id);
   assert.equal(reply.response, 'Ready');
-  assert.equal(reply.resolved_model, 'gemini-4-carbon-high');
+  assert.equal(reply.resolved_model, 'gemini-4-neon-high');
+  assert.equal(reply.conversation_model, 'gemini-4-neon-high');
   const followups = [claude, codex].map(from => startMessage({ from, to: session.address, text: 'What was the code?' }));
   const responses = await Promise.all(followups.map(item => settle(item.message_id)));
   assert.ok(responses.every(r => r.response === 'Remembered COBALT-17' && r.transport_id === reply.transport_id));
@@ -641,6 +642,106 @@ test('three participants share room history and can reply across MCP clients', a
 });
 
 
+const modelOf = args => args[args.indexOf('--model') + 1];
+const sessionRecord = conversation => join(root, 'antigravity', conversation.split(':')[1], 'session.json');
+const cli = fileURLToPath(new URL('./cli.mjs', import.meta.url));
+
+test('a conversation opened without a model runs Gemini 4 Neon and shows it everywhere', async () => {
+  const session = await handleLink('link_open_antigravity', {});
+  assert.equal(session.model, 'gemini-4-neon-high');
+  assert.equal(session.model_label, 'Gemini 4 Neon (High)');
+  assert.equal(session.name, 'Gemini 4 Neon');
+  assert.equal(session.model_verified, true);
+  assert.equal(session.warning, undefined);
+  const start = deliveries().length;
+  const reply = await settle(startMessage({ from: codex, to: session.address, text: 'Who are you?' }).message_id);
+  assert.equal(reply.status, 'accepted');
+  assert.equal(modelOf(carbonStarts(start)[0].args), 'gemini-4-neon-high');
+  assert.equal(reply.conversation_model, 'gemini-4-neon-high');
+  assert.equal(reply.resolved_model, 'gemini-4-neon-high');
+  assert.match(reply.detail, /^Gemini 4 Neon \(High\) returned a response/);
+  const listed = (await handleLink('link_sessions', { provider: 'antigravity', limit: 100 })).sessions.find(s => s.address === session.address);
+  assert.equal(listed.model, 'gemini-4-neon-high');
+  assert.equal(listed.last_resolved_model, 'gemini-4-neon-high');
+});
+
+test('model accepts short names and full ids from agy models, and Carbon stays available', async () => {
+  const cases = [['carbon', 'gemini-4-carbon-high', 'Gemini 4 Carbon'], ['Carbon-Medium', 'gemini-4-carbon-medium', 'Gemini 4 Carbon'],
+    ['neon-xhigh', 'gemini-4-neon-xhigh', 'Gemini 4 Neon'], ['gemini-4-argon-high', 'gemini-4-argon-high', 'Gemini 4 Argon'],
+    [' NEON ', 'gemini-4-neon-high', 'Gemini 4 Neon']];
+  for (const [model, id, name] of cases) {
+    const session = await handleLink('link_open_antigravity', { model });
+    assert.equal(session.model, id, model);
+    assert.equal(session.name, name, model);
+  }
+  const carbon = await handleLink('link_open_antigravity', { model: 'carbon', name: 'Carbon worker' });
+  assert.equal(carbon.name, 'Carbon worker');
+  const start = deliveries().length;
+  const reply = await settle(startMessage({ from: codex, to: carbon.address, text: 'Hello' }).message_id);
+  assert.equal(modelOf(carbonStarts(start)[0].args), 'gemini-4-carbon-high');
+  assert.equal(reply.resolved_model, 'gemini-4-carbon-high');
+  assert.equal(reply.conversation_model, 'gemini-4-carbon-high');
+});
+
+test('an address reused from another session and process keeps its model on every turn', async () => {
+  const session = await handleLink('link_open_antigravity', { model: 'carbon' });
+  const start = deliveries().length;
+  const first = await settle(startMessage({ from: codex, to: session.address, text: 'Remember ZINC-4' }).message_id);
+  // Another agent finds the address through the CLI, a separate process with its own module state.
+  const listed = spawnSync(process.execPath, [cli, 'sessions', '--provider', 'antigravity', '--limit', '100'], { encoding: 'utf8', env: process.env });
+  assert.equal(listed.status, 0, listed.stderr);
+  const found = JSON.parse(listed.stdout).sessions.find(s => s.address === session.address);
+  assert.equal(found.model, 'gemini-4-carbon-high');
+  const second = await settle(startMessage({ from: claude, to: found.address, text: 'What was the code?' }).message_id);
+  assert.equal(second.response, 'Remembered COBALT-17'); // the fake answers a resumed conversation with this fixed text
+  assert.equal(second.transport_id, first.transport_id);
+  assert.deepEqual(carbonStarts(start).map(r => modelOf(r.args)), ['gemini-4-carbon-high', 'gemini-4-carbon-high']);
+});
+
+test('an unknown model fails at open with the available list and creates nothing', async () => {
+  const before = carbonCount();
+  await assert.rejects(handleLink('link_open_antigravity', { model: 'carbon-xhigh' }),
+    /does not offer the model "carbon-xhigh" \(resolved to gemini-4-carbon-xhigh\)\. Available: gemini-4-neon-high, .*gemini-4-carbon-high/);
+  await assert.rejects(handleLink('link_open_antigravity', { model: 'gpt-9' }), /Available: .*Short names: neon, carbon/);
+  await assert.rejects(handleLink('link_open_antigravity', { model: '../neon' }), /not a model name or id/);
+  await assert.rejects(handleLink('link_open_antigravity', { model: 7 }), /Invalid model/);
+  assert.equal(carbonCount(), before);
+});
+
+test('agy models unavailable: open is accepted unverified and open conversations keep working', async () => {
+  const existing = await handleLink('link_open_antigravity', { model: 'carbon' });
+  try {
+    process.env.LINK_TEST_MODE = 'agy-models-offline';
+    const fresh = await handleLink('link_open_antigravity', {});
+    assert.equal(fresh.model, 'gemini-4-neon-high');
+    assert.equal(fresh.model_verified, false);
+    assert.match(fresh.warning, /agy models is unavailable \(Error: failed to fetch models.*\); gemini-4-neon-high was not checked/);
+    // The open conversation never asks agy models again: its sends run with the stored model.
+    const start = deliveries().length;
+    const reply = await settle(startMessage({ from: codex, to: existing.address, text: 'Still there?' }).message_id);
+    assert.equal(reply.status, 'accepted');
+    assert.equal(modelOf(carbonStarts(start)[0].args), 'gemini-4-carbon-high');
+  } finally {
+    delete process.env.LINK_TEST_MODE;
+  }
+});
+
+test('a conversation stored before model choice migrates to Carbon, its original model', async () => {
+  const session = await handleLink('link_open_antigravity', {});
+  const path = sessionRecord(session.address);
+  const { model, model_label: label, ...legacy } = JSON.parse(readFileSync(path, 'utf8'));
+  writeFileSync(path, JSON.stringify({ ...legacy, name: 'Gemini 4 Carbon' }));
+  const listed = (await handleLink('link_sessions', { provider: 'antigravity', limit: 100 })).sessions.find(s => s.address === session.address);
+  assert.equal(listed.model, 'gemini-4-carbon-high');
+  assert.equal(listed.model_label, 'Gemini 4 Carbon (High)');
+  const start = deliveries().length;
+  const reply = await settle(startMessage({ from: codex, to: session.address, text: 'Hello' }).message_id);
+  assert.equal(reply.status, 'accepted');
+  assert.equal(modelOf(carbonStarts(start)[0].args), 'gemini-4-carbon-high');
+  assert.equal(reply.resolved_model, 'gemini-4-carbon-high');
+  assert.equal(reply.conversation_model, 'gemini-4-carbon-high');
+});
+
 test('Carbon without a workspace keeps the advisory flags exactly', async () => {
   const session = await handleLink('link_open_antigravity', { name: 'Advisory' });
   assert.equal(session.workspace, null);
@@ -650,7 +751,7 @@ test('Carbon without a workspace keeps the advisory flags exactly', async () => 
   const [begin] = carbonStarts(start);
   const id = session.address.split(':')[1];
   assert.deepEqual(begin.args, [
-    '--model', 'gemini-4-carbon-high', '--input-format', 'stream-json', '--output-format', 'stream-json',
+    '--model', 'gemini-4-neon-high', '--input-format', 'stream-json', '--output-format', 'stream-json',
     '--disable-slash-commands', '--sandbox', '--settings',
     '{"toolPermission":"request-review","permissions":{"deny":["command(*)","unsandboxed(*)","read_file(*)","write_file(*)","read_url(*)","execute_url(*)","download_url(*)","mcp(*)"]}}',
     '--print-timeout', '10m', '--log-file', begin.args.at(-1),
@@ -951,7 +1052,7 @@ test('a finished Carbon turn is delivered to reply_to over the normal transport,
   const courier = deliveries().filter(d => d.transport === 'claude').at(-1);
   assert.match(courier.body, /Harness Link reply notification/);
   assert.match(courier.body, /needs no reply/);
-  assert.ok(courier.body.includes(JSON.stringify(`Gemini 4 Carbon finished your message ${fromClaude.message_id}.\n\nReady`).slice(1, -1)));
+  assert.ok(courier.body.includes(JSON.stringify(`Gemini 4 Neon (High) finished your message ${fromClaude.message_id}.\n\nReady`).slice(1, -1)));
   // Codex senders get the reply in their queue; failures are delivered too.
   const failed = await settle(startMessage({ from: codex, to: session.address, text: 'FAKE:exit' }).message_id);
   const failReply = await settle(await waitFor(() => messageStatus(failed.message_id).reply_message_id));

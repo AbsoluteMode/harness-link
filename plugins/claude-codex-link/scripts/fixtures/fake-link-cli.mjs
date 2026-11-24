@@ -8,6 +8,18 @@ const claudeId = '11111111-1111-4111-8111-111111111111';
 const randomConversation = () => randomUUID();
 const rejectionsOf = key => existsSync(process.env.LINK_TEST_DELIVERIES) ? readFileSync(process.env.LINK_TEST_DELIVERIES, 'utf8').split('\n').filter(l => l.includes(`"key":"${key}"`)).length : 0;
 const record = value => appendFileSync(process.env.LINK_TEST_DELIVERIES, JSON.stringify(value) + '\n');
+if (args[0] === 'models') {
+  // Shape of `agy models` 1.5.16: a progress line on stderr, then "<id>\t<label>" lines on stdout.
+  process.stderr.write('Fetching available models...\n');
+  if (process.env.LINK_TEST_MODE === 'agy-models-offline') {
+    process.stderr.write('Error: failed to fetch models: dial tcp: lookup antigravity: no such host\n');
+    process.exit(1);
+  }
+  for (const [id, label] of [['gemini-4-neon-high', 'Gemini 4 Neon (High)'], ['gemini-4-neon-xhigh', 'Gemini 4 Neon (XHigh)'],
+    ['gemini-4-neon-low', 'Gemini 4 Neon (Low)'], ['gemini-4-carbon-high', 'Gemini 4 Carbon (High)'],
+    ['gemini-4-carbon-medium', 'Gemini 4 Carbon (Medium)'], ['gemini-4-argon-high', 'Gemini 4 Argon (High)']]) console.log(`${id}\t${label}`);
+  process.exit(0);
+}
 if (args[0] === '--model') {
   const mode = process.env.LINK_TEST_MODE;
   const conversation = args.includes('--conversation')

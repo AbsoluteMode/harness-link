@@ -1,7 +1,7 @@
 {
   "name": "claude-codex-link",
-  "version": "0.10.0",
-  "description": "Persistent Claude consultations and addressed messages across Claude Code, Codex, and Gemini 4 Carbon.",
+  "version": "0.11.0",
+  "description": "Persistent Claude consultations and addressed messages across Claude Code, Codex, and Antigravity (Gemini 4 Neon, Carbon).",
   "author": {
     "name": "max"
   },
@@ -17,8 +17,8 @@
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Harness Link",
-    "shortDescription": "Talk across Claude Code, Codex, and Gemini 4 Carbon.",
-    "longDescription": "Persistent Claude consultations and addressed messages across Claude Code, Codex, and Gemini 4 Carbon.",
+    "shortDescription": "Talk across Claude Code, Codex, and Antigravity (Gemini 4 Neon, Carbon).",
+    "longDescription": "Persistent Claude consultations and addressed messages across Claude Code, Codex, and Antigravity (Gemini 4 Neon, Carbon).",
     "developerName": "max",
     "category": "Productivity",
     "capabilities": [
@@ -29,7 +29,7 @@
     "defaultPrompt": [
       "Ask Opus for a quick independent opinion without repository tools.",
       "Ask Claude to investigate and fix this issue, then run the tests.",
-      "Open a shared Gemini 4 Carbon conversation."
+      "Open a shared Gemini 4 Neon or Carbon conversation in Antigravity."
     ]
   }
 }

@@ -1,8 +1,8 @@
 {
   "name": "claude-codex-link",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "private": true,
-  "description": "Connect Claude Code, Codex, and Gemini 4 Carbon with persistent conversations.",
+  "description": "Connect Claude Code, Codex, and Antigravity (Gemini 4 Neon, Carbon) with persistent conversations.",
   "type": "module",
   "scripts": {
     "test": "node plugins/claude-codex-link/scripts/test-server.mjs && node --test plugins/claude-codex-link/scripts/test-link.mjs",

@@ -11,7 +11,14 @@ import { atomicWriteJson, ensurePrivateDirectory } from './lib.mjs';
 import { CappedFile, privateEmptyFile, redact, sanitizeFile, tail } from './journal.mjs';
 import { address, UUID } from './transports.mjs';
 
-export const CARBON_MODEL = 'gemini-4-carbon-high';
+// WHY: .project-docs/decisions/antigravity-model-choice.md
+// Gemini 4 Neon is the default executor since 0.11.0; a conversation keeps the model it was opened with.
+export const DEFAULT_ANTIGRAVITY_MODEL = 'gemini-4-neon-high';
+// Conversations opened before 0.11.0 ran Carbon; a record without a model field is one of them.
+export const LEGACY_ANTIGRAVITY_MODEL = 'gemini-4-carbon-high';
+const MODEL_FAMILIES = ['neon', 'carbon', 'argon', 'hydrogen'];
+const MODEL_ID = /^[a-z0-9][a-z0-9.-]{0,79}$/;
+const MODELS_TIMEOUT_MS = 20_000;
 export const CARBON_MODES = ['agent', 'review'];
 export const DEFAULT_TIMEOUT_MINUTES = { advisory: 10, review: 30, agent: 60 };
 export const MAX_TIMEOUT_MINUTES = 240;
@@ -72,6 +79,64 @@ function reviewSettings(dirs) {
   });
 }
 
+const sessionModel = session => session.model || LEGACY_ANTIGRAVITY_MODEL;
+
+function modelLabel(id) {
+  const m = /^gemini-4-([a-z]+)-([a-z]+)$/.exec(id);
+  if (!m) return id;
+  const cap = w => w === 'xhigh' ? 'XHigh' : w[0].toUpperCase() + w.slice(1);
+  return `Gemini 4 ${cap(m[1])} (${cap(m[2])})`;
+}
+
+/** Turns a short name (neon, carbon-medium) or a full id into a model id; does not check availability. */
+export function normalizeModelName(input) {
+  if (input === undefined || input === null || input === '') return DEFAULT_ANTIGRAVITY_MODEL;
+  if (typeof input !== 'string') throw new Error('model must be a string.');
+  const value = input.trim().toLowerCase();
+  const short = new RegExp(`^(?:gemini-4-)?(${MODEL_FAMILIES.join('|')})(?:-(low|medium|high|xhigh))?$`).exec(value);
+  if (short) return `gemini-4-${short[1]}-${short[2] || 'high'}`;
+  if (!MODEL_ID.test(value)) throw new Error(`model is not a model name or id: ${input}`);
+  return value;
+}
+
+/** Lists the models `agy models` offers: [{ id, label }], or { error } when the CLI cannot answer. */
+export function listAntigravityModels() {
+  const run = spawnSync(antigravityCli(), ['models'], {
+    encoding: 'utf8', timeout: MODELS_TIMEOUT_MS, stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1024 * 1024,
+  });
+  if (run.error || run.status !== 0) {
+    const why = run.error?.code === 'ETIMEDOUT' ? 'timed out'
+      : run.error ? run.error.message
+        : redact((run.stderr || '').trim().split('\n').filter(l => l && !/^Fetching/.test(l)).at(-1) || `exit code ${run.status}`);
+    return { error: String(why).slice(0, 300) };
+  }
+  const models = (run.stdout || '').split('\n').map(line => line.split('\t'))
+    .filter(([id]) => id && MODEL_ID.test(id.trim()))
+    .map(([id, label]) => ({ id: id.trim(), label: (label || id).trim() }));
+  return models.length ? { models } : { error: 'agy models returned no models' };
+}
+
+/**
+ * Resolves the model for a new conversation and checks it against `agy models`. An unknown model fails at
+ * once with the available list. When agy cannot list models, the name is accepted unverified with a warning
+ * so an outage does not block opening; existing conversations never call this.
+ */
+export function resolveAntigravityModel(input, list = listAntigravityModels) {
+  const id = normalizeModelName(input);
+  const catalog = list();
+  if (catalog.error) {
+    return { model: id, model_label: modelLabel(id), model_verified: false,
+      warning: `agy models is unavailable (${catalog.error}); ${id} was not checked. If Antigravity does not offer it, the first link_send fails with carbon_unavailable.` };
+  }
+  const hit = catalog.models.find(m => m.id === id);
+  if (!hit) {
+    throw new Error(`Antigravity does not offer the model ${JSON.stringify(input)}` + (id !== input ? ` (resolved to ${id})` : '') +
+      `. Available: ${catalog.models.map(m => m.id).join(', ')}. Short names: ${MODEL_FAMILIES.join(', ')}, ` +
+      'optionally with -low, -medium, -high or -xhigh (default high).');
+  }
+  return { model: id, model_label: hit.label, model_verified: true };
+}
+
 function validDirectory(path, label) {
   if (typeof path !== 'string' || path.length > 4096 || !isAbsolute(path)) {
     throw new Error(`${label} must be an absolute path to an existing directory.`);
@@ -92,7 +157,7 @@ export function validateCarbonScope({ workspace, mode, add_dirs: addDirs } = {},
   }
   if (workspace === undefined || workspace === null || workspace === '') {
     if (mode !== undefined && mode !== null) {
-      throw new Error('mode requires a workspace. Omit both for a text-only Carbon conversation.');
+      throw new Error('mode requires a workspace. Omit both for a text-only conversation.');
     }
     if (extras.length) throw new Error('add_dirs requires a workspace.');
     return { workspace: null, mode: 'advisory', add_dirs: [] };
@@ -129,7 +194,7 @@ export function carbonArgs(session, { timeout, logFile, dirs = [] } = {}) {
   const settings = session.mode === 'agent' ? agentSettings(session, dirs)
     : session.mode === 'review' ? reviewSettings(dirs) : SETTINGS;
   const args = [
-    '--model', CARBON_MODEL, '--input-format', 'stream-json', '--output-format', 'stream-json',
+    '--model', sessionModel(session), '--input-format', 'stream-json', '--output-format', 'stream-json',
     '--disable-slash-commands', '--sandbox',
     ...(session.mode === 'agent' ? ['--mode', 'auto'] : []),
     '--settings', settings,
@@ -207,8 +272,9 @@ function updateSession(directory, patch) {
   return next;
 }
 
-export function openAntigravity(linkDir, { name, workspace, mode, add_dirs: addDirs } = {}) {
+export function openAntigravity(linkDir, { name, workspace, mode, add_dirs: addDirs, model } = {}) {
   const scope = validateCarbonScope({ workspace, mode, add_dirs: addDirs }, linkDir);
+  const chosen = resolveAntigravityModel(model);
   const id = randomUUID();
   const directory = sessionDirectory(linkDir, id);
   ensurePrivateDirectory(linkDir);
@@ -217,14 +283,16 @@ export function openAntigravity(linkDir, { name, workspace, mode, add_dirs: addD
   mkdirSync(join(directory, 'workspace'), { mode: 0o700 });
   const session = {
     address: `antigravity:${id}`,
-    name: name?.trim() || 'Gemini 4 Carbon',
-    model: CARBON_MODEL,
+    name: name?.trim() || chosen.model_label.replace(/ \((?:Low|Medium|High|XHigh)\)$/, ''),
+    model: chosen.model,
+    model_label: chosen.model_label,
     ...(scope.workspace ? { workspace: scope.workspace, mode: scope.mode } : {}),
     ...(scope.add_dirs.length ? { add_dirs: scope.add_dirs } : {}),
     created_at: new Date().toISOString(),
   };
   atomicWriteJson(join(directory, 'session.json'), session);
-  return { ...session, workspace: scope.workspace, mode: scope.mode, add_dirs: scope.add_dirs };
+  return { ...session, workspace: scope.workspace, mode: scope.mode, add_dirs: scope.add_dirs,
+    model_verified: chosen.model_verified, ...(chosen.warning ? { warning: chosen.warning } : {}) };
 }
 
 export function listAntigravity(linkDir, { cwd, limit, cursor }) {
@@ -248,17 +316,20 @@ function lockOwner(directory) {
 }
 
 function publicSession(directory, session) {
-  const { address, name, model, workspace = null, mode, add_dirs: addDirs = [], created_at, conversation_id } = session;
+  const { address, name, workspace = null, mode, add_dirs: addDirs = [], created_at, conversation_id } = session;
+  const model = sessionModel(session);
   const owner = lockOwner(directory);
   let status = 'available';
   if (session.blocked) status = 'blocked';
   else if (owner && runnerAlive(owner)) status = 'busy';
   else if (session.active_turn || session.interrupted) status = 'interrupted';
   return {
-    address, name, model, workspace, mode: workspace ? mode : 'advisory', add_dirs: addDirs, created_at, status,
+    address, name, model, model_label: session.model_label || modelLabel(model),
+    ...(session.last_resolved_model ? { last_resolved_model: session.last_resolved_model } : {}),
+    workspace, mode: workspace ? mode : 'advisory', add_dirs: addDirs, created_at, status,
     native_conversation: Boolean(conversation_id),
     ...(status === 'interrupted' ? { detail: 'The last turn stopped before it finished. The next message resumes this conversation' +
-      (conversation_id ? ' with its context.' : '; its native context was not saved, so Carbon is told to check the workspace first.') } : {}),
+      (conversation_id ? ' with its context.' : '; its native context was not saved, so the model is told to check the workspace first.') } : {}),
     ...(session.blocked ? { detail: blockedText(session.blocked) } : {}),
   };
 }
@@ -296,22 +367,22 @@ function turnError(code, message, extra = {}) {
 
 function blockedText(reason) {
   return reason === 'model_mismatch'
-    ? 'An earlier Antigravity turn did not confirm the pinned Carbon model, so this conversation is blocked. Open a new Link conversation.'
+    ? 'An earlier Antigravity turn did not confirm the conversation\'s pinned model, so this conversation is blocked. Open a new Link conversation.'
     : 'An earlier Antigravity turn returned a different native conversation, so this conversation is blocked. Open a new Link conversation.';
 }
 
 export const NEXT_STEPS = {
-  permission_denied: 'Reply to the same address with how to proceed (the conversation keeps its context), or open a new conversation with add_dirs that cover the path Carbon needs.',
-  timeout: 'Send a follow-up to the same address to let Carbon continue (the conversation keeps its context), or resend with a larger timeout_minutes.',
+  permission_denied: 'Reply to the same address with how to proceed (the conversation keeps its context), or open a new conversation with add_dirs that cover the path the model needs.',
+  timeout: 'Send a follow-up to the same address to let the model continue (the conversation keeps its context), or resend with a larger timeout_minutes.',
   cancelled: 'Send a new message to the same address to continue; the conversation keeps its context.',
   agy_exited: 'Read the journal tail. Send a follow-up to the same address to continue; the conversation keeps its context.',
   carbon_error: 'Read the journal tail. Send a follow-up to the same address to retry; the conversation keeps its context.',
-  empty_response: 'Ask Carbon in a follow-up to summarise what it did.',
+  empty_response: 'Ask the model in a follow-up to summarise what it did.',
   protocol_error: 'Read the journal and check that agy works with `agy models`, then send a follow-up.',
   model_mismatch: 'Open a new Link conversation; this one is blocked.',
   conversation_mismatch: 'Open a new Link conversation; this one is blocked.',
-  runner_lost: 'Send the next message to the same address; Harness Link resumes the conversation and tells Carbon to check the workspace first.',
-  carbon_unavailable: 'Check agy authentication and Carbon availability with `agy models`, then send again with a new message_id.',
+  runner_lost: 'Send the next message to the same address; Harness Link resumes the conversation and tells the model to check the workspace first.',
+  carbon_unavailable: 'Check agy authentication and that `agy models` lists the conversation\'s model, then send again with a new message_id.',
   agy_unavailable: 'Install agy or set CLAUDE_CODEX_LINK_AGY_CLI, then send again with a new message_id.',
 };
 
@@ -408,7 +479,7 @@ function recoverTurn(linkDir, directory, session) {
       const state = JSON.parse(readFileSync(statePath, 'utf8'));
       if (['pending', 'sending'].includes(state.status) && !runnerAlive(state)) {
         atomicWriteJson(statePath, { ...state, status: 'error', error_code: 'runner_lost',
-          error: 'The Link runner stopped during this turn before Carbon answered.', next_step: NEXT_STEPS.runner_lost,
+          error: 'The Link runner stopped during this turn before the model answered.', next_step: NEXT_STEPS.runner_lost,
           transport: 'antigravity-cli', transport_id: session.conversation_id || null, completed_at: new Date().toISOString() });
       }
     } catch {}
@@ -584,13 +655,15 @@ function isRetryableFailure(failure, run) {
 
 function classify(run, session) {
   if (run.spawnError) return turnError('agy_unavailable', 'The Antigravity CLI could not start.', { notSent: true });
-  if (run.cancelled) return turnError('cancelled', 'Cancelled by link_cancel; Carbon stopped mid-turn.');
+  if (run.cancelled) return turnError('cancelled', 'Cancelled by link_cancel; the model stopped mid-turn.');
   const result = run.result;
   if (!run.init && run.code !== 0 && result?.status === 'ERROR' && !result.conversation_id) {
-    return turnError('carbon_unavailable', 'Antigravity rejected the request before starting a conversation. Check agy authentication and Carbon availability with agy models.', { notSent: true });
+    return turnError('carbon_unavailable', `Antigravity rejected the request before starting a conversation. Check agy authentication and that agy models lists ${sessionModel(session)}.`, { notSent: true });
   }
   if (run.init) {
-    if (run.init.init?.model !== CARBON_MODEL) return turnError('model_mismatch', 'Antigravity did not confirm the pinned Carbon model.', { block: 'model_mismatch' });
+    if (run.init.init?.model !== sessionModel(session)) {
+      return turnError('model_mismatch', `Antigravity answered with ${run.init.init?.model || 'no model'} instead of the pinned ${sessionModel(session)}.`, { block: 'model_mismatch' });
+    }
     if (!UUID.test(run.init.conversation_id || '') ||
         (session.conversation_id && run.init.conversation_id !== session.conversation_id) ||
         (result?.conversation_id && result.conversation_id !== run.init.conversation_id)) {
@@ -599,7 +672,7 @@ function classify(run, session) {
   }
   const error = agyError(run.stderrText);
   if (run.timedOut || result?.finished_reason === 'print_timeout' || error?.reason === 'print_timeout') {
-    return turnError('timeout', 'Carbon reached the turn time limit before it answered.');
+    return turnError('timeout', 'The model reached the turn time limit before it answered.');
   }
   if (!run.init) {
     return turnError('protocol_error', result
@@ -617,7 +690,7 @@ function classify(run, session) {
     return turnError('permission_denied', `agy denied a tool call that needs a human confirmation in headless mode: ${(run.denied.length ? run.denied : deniedActions).join('; ')}.`);
   }
   if (result.status === 'SUCCESS' && run.code === 0) {
-    return turnError('empty_response', 'Carbon finished the turn without a text response.');
+    return turnError('empty_response', 'The model finished the turn without a text response.');
   }
   return turnError('carbon_error', `agy reported ${result.status || 'no status'}${error?.short_error ? `: ${error.short_error}` : ''}` +
     `${run.code ? ` (exit code ${run.code})` : ''}.`);
@@ -648,7 +721,7 @@ function processOutbox(outbox, session, deliver, record) {
       if (record.sent >= MAX_OUTBOX_PER_TURN) throw new Error(`At most ${MAX_OUTBOX_PER_TURN} outbox messages per turn.`);
       if (item.to) {
         const target = address(item.to).address;
-        if (target === session.address) throw new Error('Carbon cannot message its own conversation.');
+        if (target === session.address) throw new Error('A conversation cannot message its own conversation.');
         if (!(session.peers || []).includes(target)) throw new Error('to must be one of the known addresses listed in your instructions.');
         item.to = target;
       }
@@ -752,7 +825,7 @@ export async function sendAntigravity(linkDir, message, { cancelled = () => fals
         },
         onInit: event => {
           const id = event.conversation_id;
-          if (event.init?.model === CARBON_MODEL && UUID.test(id || '') && !session.conversation_id) {
+          if (event.init?.model === sessionModel(session) && UUID.test(id || '') && !session.conversation_id) {
             session = updateSession(directory, { conversation_id: id });
           }
           progress.conversation_id = id || progress.conversation_id;
@@ -798,8 +871,9 @@ export async function sendAntigravity(linkDir, message, { cancelled = () => fals
     }
     processOutbox(outbox, session, deliverOutbox, outboxRecord);
     if (failure?.block) session = updateSession(directory, { blocked: failure.block });
+    if (run?.init?.init?.model) session = updateSession(directory, { last_resolved_model: run.init.init.model });
     if (failure?.code === 'permission_denied' && denialContinues > 0) {
-      failure.message += ` Harness Link asked Carbon to continue without it ${denialContinues} time(s).`;
+      failure.message += ` Harness Link asked the model to continue without it ${denialContinues} time(s).`;
     }
     progress.phase = 'finished';
     progress.finished_at = new Date().toISOString();
@@ -821,15 +895,16 @@ export async function sendAntigravity(linkDir, message, { cancelled = () => fals
       Object.assign(failure, common, { next_step: NEXT_STEPS[failure.code] || null });
       throw failure;
     }
+    const who = session.model_label || modelLabel(sessionModel(session));
     return {
       status: 'accepted', ...common,
-      resolved_model: CARBON_MODEL,
+      resolved_model: run.init.init.model,
       response: completedText(run),
       detail: denialContinues > 0
-        ? `Gemini 4 Carbon returned a response after ${denialContinues} denied tool call(s); see denied.`
+        ? `${who} returned a response after ${denialContinues} denied tool call(s); see denied.`
         : transientContinues > 0
-          ? 'Gemini 4 Carbon returned a response after recovering from an interrupted turn.'
-          : 'Gemini 4 Carbon returned a response.',
+          ? `${who} returned a response after recovering from an interrupted turn.`
+          : `${who} returned a response.`,
     };
   } finally {
     if (owned) {
