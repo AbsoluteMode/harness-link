@@ -39,10 +39,10 @@ returns to `reply_to` as a reply notification. A chat running a turn is only
 queued; `live` then refuses. Never resume a session in a second process
 yourself. Never modify session logs or bypass an access refusal.
 
-## Gemini 4 Carbon
+## Antigravity (default Gemini 4 Neon)
 
-`link_open_antigravity` (or `link_sessions`), then send to its address. The
-turn's response or failure arrives at `reply_to`; it needs no answer.
+`link_open_antigravity` (optional `model`, e.g. `carbon`; fixed per
+address), then send to its address. The turn's response or failure arrives at `reply_to`; it needs no answer.
 `link_status` shows `progress`, `error_code`, `next_step`. `workspace` with
 `mode: agent` edits and runs sandboxed commands, `review` reads; `add_dirs`
 grants extra directories. `timeout_minutes` and `link_cancel` bound a turn.

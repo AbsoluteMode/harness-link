@@ -17,7 +17,7 @@ sources:
   - type: trace
     reference: Live agy 1.5.9 runs against disposable mktemp directories on 2026-11-15, described under Rationale.
     confirmed_at: 2026-11-15
-related: [../processes/session-link.md, carbon-worker-turns.md]
+related: [../processes/session-link.md, carbon-worker-turns.md, antigravity-model-choice.md]
 ---
 
 # Carbon workspace agent and review modes

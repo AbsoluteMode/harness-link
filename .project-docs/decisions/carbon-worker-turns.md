@@ -20,7 +20,7 @@ sources:
   - type: trace
     reference: agy 1.5.9 CLI logs and conversation records of the two failed turns on 2026-11-15, and live runs described under Rationale.
     confirmed_at: 2026-11-15
-related: [carbon-workspace-modes.md, codex-wake.md, ../processes/session-link.md, ../bugs/carbon-midturn-stream-drops.md]
+related: [carbon-workspace-modes.md, antigravity-model-choice.md, codex-wake.md, ../processes/session-link.md, ../bugs/carbon-midturn-stream-drops.md]
 ---
 
 # Carbon worker turns, journal, recovery and reply delivery
